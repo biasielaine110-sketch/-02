@@ -144,3 +144,43 @@ func TestAuthLayerBehavior(t *testing.T) {
 		t.Error("valid key must pass the auth layer")
 	}
 }
+
+func TestGetConfigRedactsSecrets(t *testing.T) {
+	p := New(Config{
+		APIKey: "test-key",
+		LoadConfig: func() (any, error) {
+			return map[string]any{
+				"api_key": "gateway-secret",
+				"upstream": map[string]any{
+					"device_token": "device-secret",
+					"client_name":  "WorkBuddy",
+				},
+				"upstash": map[string]any{
+					"token": "storage-secret",
+					"url":   "https://example.upstash.io",
+				},
+			}, nil
+		},
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/panel/api/config", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, secret := range []string{"gateway-secret", "device-secret", "storage-secret"} {
+		if strings.Contains(body, secret) {
+			t.Errorf("config response exposes secret %q", secret)
+		}
+	}
+	for _, key := range []string{`"api_key"`, `"device_token"`, `"token"`} {
+		if strings.Contains(body, key) {
+			t.Errorf("config response exposes sensitive key %s", key)
+		}
+	}
+	if !strings.Contains(body, `"client_name":"WorkBuddy"`) {
+		t.Errorf("config response lost non-sensitive value: %s", body)
+	}
+}

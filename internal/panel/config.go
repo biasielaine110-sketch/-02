@@ -6,12 +6,15 @@
 package panel
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 )
 
-// getConfig 返回当前配置文件内容与路径（前端按 schema 渲染表单）。
+// getConfig 返回用于面板表单的配置副本与路径。密钥只允许写入或轮换，绝不经
+// 读取接口回显，以免 API key、上游设备令牌或外部存储令牌进入浏览器存储和日志。
 func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.LoadConfig == nil {
 		writeErr(w, http.StatusNotImplemented, "config api not available")
@@ -22,11 +25,55 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "load config: "+err.Error())
 		return
 	}
+	view, err := redactConfig(cfg)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "encode config view: "+err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"path":   p.cfg.ConfigPath,
-		"config": cfg,
+		"config": view,
 	})
+}
+
+// redactConfig creates an independent JSON-compatible view and removes fields
+// whose names identify secrets. Keeping this generic prevents new config
+// secrets from being accidentally exposed before the panel schema is updated.
+func redactConfig(cfg any) (any, error) {
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var view any
+	if err := json.Unmarshal(raw, &view); err != nil {
+		return nil, err
+	}
+	redactConfigValue(view)
+	return view, nil
+}
+
+func redactConfigValue(v any) {
+	switch value := v.(type) {
+	case map[string]any:
+		for key, child := range value {
+			if isSensitiveConfigKey(key) {
+				delete(value, key)
+				continue
+			}
+			redactConfigValue(child)
+		}
+	case []any:
+		for _, child := range value {
+			redactConfigValue(child)
+		}
+	}
+}
+
+func isSensitiveConfigKey(key string) bool {
+	key = strings.ToLower(key)
+	return strings.Contains(key, "token") || strings.Contains(key, "secret") ||
+		strings.Contains(key, "password") || key == "api_key" || key == "apikey"
 }
 
 // saveConfig 保存配置：body 直接是配置 JSON（前端按 schema 组装完整对象）。
