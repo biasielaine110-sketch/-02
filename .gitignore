@@ -39,6 +39,9 @@ docs/
 /wb2api.exe
 /login.exe
 /credit.exe
+# go build 在目标 exe 正被运行时留下的备份文件（Windows 专有行为）。
+# 不忽略它会让工作区变脏，进而让 go build 把版本标成 "+dirty"。
+/*.exe~
 
 # 运行日志（进程 stdout/stderr 重定向产物，含账号 uid 与行为痕迹，不入库）
 *.log
