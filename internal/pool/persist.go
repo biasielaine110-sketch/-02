@@ -184,6 +184,40 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
 	p.applyAccountsLocked(s.Accounts)
 }
+
+// ReplaceFromState 用「state.json 的原始字节 + auths 扫描结果」整体替换池状态。
+//
+// 供面板「导入账号池」使用。为什么不复用 ReloadFromDir 式的「先写盘再重读」：
+// 导入过程中文件已经换成新的、内存还是旧的，那个窗口里 5s 一次的 flusher 若恰好
+// 触发，会拿旧状态把刚导入的 state.json 覆盖掉。这里改为**直接吃字节**——内存状态
+// 由入参决定，state.json 由本方法持锁后统一写回，最后一次写盘一定是我们这次，
+// 不受 flusher 时序影响。
+//
+// raw 为空或解析失败时等价于「运行状态归零，只认 auths 目录」，不会报错中止导入：
+// 缺一份 state.json 不该让整包导入失败（账号凭证才是主体）。
+//
+// 返回值 stateApplied 表示「这份 state 是否真的解析并应用了」。调用方（面板导入）
+// 必须据此区分「包里没带 state」和「带了但没法用」——两者都会让运行状态归零，
+// 但前者是正常的，后者意味着用户拿到的是一份坏包，需要明确告诉他，不能报成导入成功。
+//
+// 全程持锁，中途不会出现「只有 UID、没有凭证」的 placeholder 条目被 Pick 选中。
+func (p *Pool) ReplaceFromState(raw []byte, auths []*auth.Auth) (stateApplied bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.byUID = map[string]*entry{}
+	if len(raw) > 0 {
+		var sf stateFile
+		if json.Unmarshal(raw, &sf) == nil {
+			p.applyAccountsLocked(sf.Accounts)
+			stateApplied = true
+		}
+	}
+	p.syncToDirLocked(auths)
+	p.dirty.Store(true)
+	p.saveLocked()
+	return stateApplied
+}
+
 func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
 		return

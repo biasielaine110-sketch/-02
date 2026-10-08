@@ -34,6 +34,7 @@ type Config struct {
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
+	StateFile string               // 账号池状态文件（data/state.json）；账号池导入导出按同目录取 data/
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
 	RedisMode string               // "upstash" / "noop"，仅观测透出
 	Version   string               // 面板版本号（展示用）
@@ -178,6 +179,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	// 账号池跨机迁移（pooltransfer.go）：导出打包下载、导入上传替换并热加载。
+	p.mux.HandleFunc("GET /panel/api/pool/export", p.withAuth(p.poolExport))
+	p.mux.HandleFunc("POST /panel/api/pool/import", p.withAuth(p.poolImport))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API

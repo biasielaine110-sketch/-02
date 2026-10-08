@@ -514,6 +514,85 @@ $('cfgForm').onsubmit = async ev => {
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
 };
 
+/* ── 账号池迁移（导入 / 导出）─────────────────────────────────────── */
+// 导出走 fetch 拿二进制再本地落地，而不是 <a href> 直接点：
+// 接口要带 Bearer 头鉴权，普通导航链接没法附加自定义请求头。
+$('btnPoolExport').onclick = async () => {
+  const btn = $('btnPoolExport'), note = $('poolExpNote');
+  btn.disabled = true; btn.textContent = '打包中…'; note.textContent = '';
+  try {
+    const k = localStorage.getItem(LS_KEY);
+    const r = await fetch('/panel/api/pool/export', { headers: k ? { 'Authorization': 'Bearer ' + k } : {} });
+    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.error || ('HTTP ' + r.status)); }
+    // 文件名优先用服务端 Content-Disposition 里的，拿不到再自己拼。
+    const m = /filename="([^"]+)"/.exec(r.headers.get('Content-Disposition') || '');
+    const name = m ? m[1] : ('pool-' + new Date().toISOString().slice(0, 10) + '.zip');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    note.textContent = '已下载 ' + name + '（' + (blob.size / 1024).toFixed(1) + ' KB）';
+    toast('账号池已导出：' + name, 'ok');
+  } catch (e) {
+    note.textContent = '导出失败：' + e.message;
+    toast('导出失败：' + e.message, 'err');
+  } finally { btn.disabled = false; btn.textContent = '导出账号池'; }
+};
+
+$('btnPoolImport').onclick = async () => {
+  const f = $('poolFile').files[0];
+  const note = $('poolImpNote');
+  if (!f) { toast('先选一个账号池 zip 再导入', 'err'); return; }
+  const withCfg = $('poolWithConfig').checked;
+  const before = overviewData && overviewData.total != null ? overviewData.total : '?';
+  // 替换动作，虽然可回滚也要让人明确知道会发生什么。
+  const ok = confirm(
+    '导入会用包内账号池【替换】本机现有账号池（不是合并）。\n\n' +
+    '· 本机当前 ' + before + ' 个账号\n' +
+    '· 现有账号池会先整份备份到 backups/pre-import-时间戳/，可回滚\n' +
+    (withCfg ? '· 同时覆盖 config.json：门禁密钥会变，重启后生效\n' : '· config.json 保持本机不变\n') +
+    '\n确定继续？');
+  if (!ok) return;
+
+  const btn = $('btnPoolImport');
+  btn.disabled = true; btn.textContent = '导入中…'; note.textContent = '';
+  try {
+    const fd = new FormData();
+    fd.append('package', f);
+    if (withCfg) fd.append('config', '1');
+    const k = localStorage.getItem(LS_KEY);
+    // 不设 Content-Type：交给浏览器带 multipart boundary。
+    const r = await fetch('/panel/api/pool/import', {
+      method: 'POST', headers: k ? { 'Authorization': 'Bearer ' + k } : {}, body: fd,
+    });
+    if (r.status === 401) { openKey(); throw new Error('密钥无效或未填写'); }
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || !d.ok) throw new Error(d.error || ('HTTP ' + r.status));
+
+    note.textContent = '已导入：' + d.accounts_before + ' → ' + d.accounts + ' 个账号';
+    let msg = '账号池已导入：' + d.accounts + ' 个账号';
+    let bad = false;
+    if (!d.state_imported) {
+      msg += '（包内无 state.json，运行状态已归零）';
+    } else if (!d.state_applied) {
+      // 带了但解析不了：账号进来了，运行状态（积分/冷却）没了。这是坏包，不能报成完全成功。
+      msg = '账号已导入 ' + d.accounts + ' 个，但包内 state.json 无法解析，运行状态已归零（积分/冷却需重新统计）';
+      bad = true;
+    }
+    if (d.config_imported) msg += '；config.json 已覆盖，重启后生效';
+    toast(msg, bad ? 'err' : 'ok');
+    $('poolFile').value = ''; $('poolWithConfig').checked = false;
+    loadConfig();       // 配置页展示的路径/密钥可能已变
+    loadOverview(true); // 账号表立即反映新池
+  } catch (e) {
+    note.textContent = '导入失败：' + e.message;
+    toast('导入失败：' + e.message, 'err');
+  } finally { btn.disabled = false; btn.textContent = '导入账号池'; }
+};
+
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
   $('addVeil').classList.add('on');

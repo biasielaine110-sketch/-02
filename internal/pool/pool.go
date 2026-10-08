@@ -247,6 +247,11 @@ func (p *Pool) Add(a *auth.Auth) {
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.syncToDirLocked(auths)
+}
+
+// syncToDirLocked 是 SyncToDir 的锁内实现（ReplaceFromState 复用）。调用方必须已持有 p.mu。
+func (p *Pool) syncToDirLocked(auths []*auth.Auth) {
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true

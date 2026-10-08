@@ -238,6 +238,7 @@ func main() {
 		Upstream:    up,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
+		StateFile:   cfg.StateFile,
 		APIKey:      cfg.APIKey,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,

@@ -300,6 +300,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .savebar .grow { flex: 1; }
 .restart-note { color: var(--warn); font-size: 12.5px; }
 
+/* ── 账号池迁移（配置页底部，独立于配置表单）───────────────────────── */
+.pmig .lead { font-size: 13px; color: var(--ink-2); margin-bottom: 3px; }
+.pmig .sub { font-size: 11.5px; color: var(--ink-3); line-height: 1.65; }
+.pmig .col { padding-right: 20px; }
+.pmig .col + .col { border-left: 1px solid var(--line-soft); padding-left: 20px; padding-right: 0; }
+@media (max-width: 860px) { .pmig .col + .col { border-left: none; padding-left: 0; } }
+.pmig input[type=file] { padding: 6px 9px; font-size: 12.5px; }
+.pmig .acts { margin-top: 12px; display: flex; align-items: center; gap: 10px; }
+.pmig .warns { margin-top: 4px; }
+.pmig .warns .w { font-size: 11.5px; color: var(--warn); line-height: 1.65; }
+
 /* ── 弹层 ─────────────────────────────────────────────────────────── */
 .veil { position: fixed; inset: 0; background: rgba(6,8,13,.62); backdrop-filter: blur(2px); display: none; z-index: 60; }
 .veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
@@ -795,6 +806,44 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button type="submit" class="primary" id="btnCfgSave">保存配置</button>
         </div>
       </form>
+
+      <!-- 账号池迁移：刻意放在 form 之外——这不是配置项，是独立动作，且含文件上传 -->
+      <div class="box pmig">
+        <header>
+          <h3>账号池迁移</h3>
+          <span class="grow"></span>
+          <span class="note">整包搬运，免在新机器重新登录</span>
+        </header>
+        <div class="pad">
+          <div class="grid2">
+            <div class="col">
+              <div class="lead">导出</div>
+              <div class="sub">把 <b>auths/</b>、<b>data/</b>、<b>config.json</b> 打包成 zip 下载，可直接给另一台机器用。</div>
+              <div class="acts">
+                <button type="button" id="btnPoolExport">导出账号池</button>
+                <span class="sub" id="poolExpNote"></span>
+              </div>
+              <div class="warns">
+                <div class="w">包内是明文凭证：用 U 盘 / 内网 / 私有网盘搬运，别提交 git、别发公开网盘。</div>
+              </div>
+            </div>
+            <div class="col">
+              <div class="lead">导入</div>
+              <div class="sub">用包内那份<b>替换</b>本机账号池（不是合并）。改动前会把现有账号池整份备份到 <b>backups/pre-import-时间戳/</b>，可回滚。</div>
+              <input type="file" id="poolFile" accept=".zip,application/zip">
+              <div class="switch">
+                <span class="lb">同时覆盖 config.json</span>
+                <input type="checkbox" id="poolWithConfig">
+              </div>
+              <div class="sub">含网关门禁密钥。覆盖后本会话仍按旧密钥鉴权，重启才切换——默认不勾，保留本机密钥。</div>
+              <div class="acts">
+                <button type="button" class="danger" id="btnPoolImport">导入账号池</button>
+                <span class="sub" id="poolImpNote"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- 日志 -->
