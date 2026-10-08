@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,70 @@ func TestAppJSSyntax(t *testing.T) {
 	out, err := exec.Command(node, "--check", path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("app.js syntax error:\n%s", out)
+	}
+}
+
+// TestStaticAssetsAreRevalidated 面板静态资源必须带 Cache-Control + ETag。
+//
+// 为什么需要：index.html / app.js 的 URL 不带版本号，一旦没有校验头，浏览器就会一直复用旧副本。
+// 真实踩到过——新增按钮、重启网关后服务端返回的 HTML 已经含按钮，页面上却看不到，
+// 排查方向被带到了"功能没生效"上。此测试把"必须可校验"钉住。
+func TestStaticAssetsAreRevalidated(t *testing.T) {
+	p := newTestPanel()
+	for _, path := range []string{"/panel/", "/panel/app.js"} {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code=%d", path, rec.Code)
+		}
+		if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-cache") {
+			t.Errorf("%s: Cache-Control=%q, want it to contain no-cache", path, cc)
+		}
+		etag := rec.Header().Get("ETag")
+		if etag == "" {
+			t.Fatalf("%s: missing ETag", path)
+		}
+
+		// 回传同一 ETag → 304，且不带正文。
+		req := httptest.NewRequest("GET", path, nil)
+		req.Header.Set("If-None-Match", etag)
+		rec2 := httptest.NewRecorder()
+		p.ServeHTTP(rec2, req)
+		if rec2.Code != http.StatusNotModified {
+			t.Errorf("%s: revalidate code=%d, want 304", path, rec2.Code)
+		}
+		if rec2.Body.Len() != 0 {
+			t.Errorf("%s: 304 must carry no body, got %d bytes", path, rec2.Body.Len())
+		}
+
+		// 过期 ETag → 200（必须拿到新版内容）。
+		req3 := httptest.NewRequest("GET", path, nil)
+		req3.Header.Set("If-None-Match", `"stale"`)
+		rec3 := httptest.NewRecorder()
+		p.ServeHTTP(rec3, req3)
+		if rec3.Code != http.StatusOK {
+			t.Errorf("%s: stale ETag code=%d, want 200", path, rec3.Code)
+		}
+		if rec3.Body.Len() == 0 {
+			t.Errorf("%s: 200 must carry the body", path)
+		}
+	}
+}
+
+// TestStaticETagsDifferPerResource 两份资源内容不同，ETag 必须不同。
+func TestStaticETagsDifferPerResource(t *testing.T) {
+	p := newTestPanel()
+	get := func(path string) string {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		return rec.Header().Get("ETag")
+	}
+	a, b := get("/panel/"), get("/panel/app.js")
+	if a == "" || b == "" {
+		t.Fatal("ETag must not be empty")
+	}
+	if a == b {
+		t.Errorf("index.html and app.js share the same ETag %q", a)
 	}
 }
 
