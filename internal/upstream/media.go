@@ -91,7 +91,7 @@ func MediaModelCatalog() []MediaModel {
 			ID:          MioraVideoVendorPrefix() + MioraVideoModel,
 			Type:        "video",
 			Capability:  "video_generation",
-			Description: "MiniMax H3 文生视频（miora 代理，异步 POST /v1/videos/generations + GET /v1/videos/generations/{id}）",
+			Description: "MiniMax H3 视频（miora 代理，支持文生/首尾帧/参考生；异步 POST /v1/videos/generations + GET /v1/videos/generations/{id}）",
 		},
 	}
 }

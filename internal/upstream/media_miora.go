@@ -5,10 +5,20 @@
 //     响应 data.key 以 "ck_t_" 开头，900s 有效），再以 Bearer <ck_t_> 调媒体端点。
 //   - 端点：mioraBase + /api/ai/workbuddy-proxy（mioraBase 默认 https://public.miora.qq.com，
 //     与 ck_t_ 签发域**分离**）。
-//   - 提交 POST /video/submit 表单 {prompt,duration,resolution,aspect_ratio}
+//   - 提交 POST /video/submit JSON {prompt,duration,resolution,aspect_ratio[,input]}
 //     → data {upstreamTaskId, model:"minimax-h3-iOA", provider:"copilot-video"}；
-//     轮询 POST /video/query-task 表单 {upstreamTaskIds:[id]}
+//     轮询 POST /video/query-task JSON {upstreamTaskIds:[id]}
 //     → data[taskId] = {status, resultFiles:[{signedUrl,mimeType,expiresAt}]}。
+//
+// 三种模式共用同一 submit 端点，靠 input 字段区分：
+//   - 文生（text_to_video）  ：不带 input；
+//   - 首尾帧（frame_to_video）：input={first_frame_image:{…}, last_frame_image?:{…}}（首帧必填）；
+//   - 参考生（reference_to_video）：input={reference_images:[{…}, …]}（至少一张）。
+// 每个图片载荷（MediaPayload）须**恰含** base64 / url / file_key 之一，否则上游报 10005。
+//
+// 重要坑（实测）：input:{} 或 reference_images:[] 会**静默降级成文生视频**
+// （上游回 code=0 + upstreamTaskId，不报错，按文生计费出片）。故本层对帧/参考生模式
+// 强制本地校验，缺字段直接 ErrBadParams，绝不把「用户以为是图生视频、实际跑了文生」放过去。
 //
 // 契约来源：官方 miora-mcp dist/cli.cjs（MIORA_API_BASE / VIDEO_SUBMIT_PATH /
 // VIDEO_QUERY_PATH、fillVideoCommonFields、pollUntilTerminal）与 app.asar 内
@@ -121,10 +131,14 @@ func (c *Client) signClientTempKey(ctx context.Context, a *auth.Auth) (string, e
 //   - 业务失败时 HTTP 可能是 200，错误态在信封内（failed=true + httpStatus=502 等）。
 //
 // 故成功判定必须同时看 code==0 且 !failed。
+//
+// Message 用 RawMessage 而非 string：实测上游会把校验错误塞成**字符串数组**
+// （如 ["input.first_frame_image.MediaPayload requires exactly one of: base64, url, file_key"]），
+// 直接 Unmarshal 到 string 会解析失败，导致错误文案丢失、错判成「响应解析失败」。
 type mioraEnvelope struct {
 	Code       json.RawMessage `json:"code"`
 	Failed     bool            `json:"failed"`
-	Message    string          `json:"message"`
+	Message    json.RawMessage `json:"message"` // 可能是字符串，也可能是字符串数组
 	Data       json.RawMessage `json:"data"`
 	HTTPStatus int             `json:"httpStatus"`
 }
@@ -133,6 +147,35 @@ type mioraEnvelope struct {
 func mioraCodeOK(raw json.RawMessage) bool {
 	var n int
 	return json.Unmarshal(raw, &n) == nil && n == 0
+}
+
+// mioraCodeText 把信封 code 归一成无引号的文本（数值 code 原样，字符串 code 去引号）。
+func mioraCodeText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// mioraMessageText 把信封 message 压成一条文本：兼容字符串与字符串数组两种形态。
+func mioraMessageText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	var arr []string
+	if err := json.Unmarshal(raw, &arr); err == nil {
+		return strings.TrimSpace(strings.Join(arr, "; "))
+	}
+	// 兜底：去掉 JSON 数组/引号外壳后原样透出。
+	return strings.TrimSpace(strings.Trim(string(raw), `[]"`))
 }
 
 // mioraErrorKind 把 miora 错误码/文案归一到网关错误分类，决定是否罚号/轮转。
@@ -144,16 +187,21 @@ func mioraErrorKind(code, msg string) ErrKind {
 	case strings.Contains(upper, "CONTENT_SAFETY"), strings.Contains(upper, "COPYRIGHT"):
 		return ErrContentBlocked
 	}
+	// 上游媒体载荷校验码：图片载荷 base64/url/file_key 须恰含其一，缺/多字段即 10005。
+	// 用 code 判定比文案更稳（message 可能是数组、也可能本地化）。
+	if strings.TrimSpace(code) == "10005" {
+		return ErrBadParams
+	}
 	low := strings.ToLower(msg)
 	switch {
+	case strings.Contains(low, "too long"):
+		return ErrPromptTooLong
 	case strings.Contains(low, "requires prompt"),
+		strings.Contains(low, "requires exactly one"),
+		strings.Contains(low, "is required"),
 		strings.Contains(low, "unsupported"),
 		strings.Contains(low, "invalid"),
-		strings.Contains(low, "missing"),
-		strings.Contains(low, "too long"):
-		if strings.Contains(low, "too long") {
-			return ErrPromptTooLong
-		}
+		strings.Contains(low, "missing"):
 		return ErrBadParams
 	case strings.Contains(low, "safety"), strings.Contains(low, "copyright"),
 		strings.Contains(low, "敏感"), strings.Contains(low, "违规"):
@@ -190,11 +238,11 @@ func (c *Client) mioraPostCtx(ctx context.Context, ck, path string, body any) (j
 		if status < 400 {
 			status = resp.StatusCode
 		}
-		msg := strings.TrimSpace(env.Message)
+		msg := mioraMessageText(env.Message)
 		if msg == "" {
 			msg = truncate(string(raw), 300)
 		}
-		kind := mioraErrorKind(string(env.Code), msg)
+		kind := mioraErrorKind(mioraCodeText(env.Code), msg)
 		// 参数类错误回 400（而不是信封里的 502），让客户端看到「请求问题」而非「上游故障」。
 		if kind == ErrBadParams || kind == ErrPromptTooLong || kind == ErrContentBlocked {
 			status = http.StatusBadRequest
@@ -204,29 +252,166 @@ func (c *Client) mioraPostCtx(ctx context.Context, ck, path string, body any) (j
 	return env.Data, nil
 }
 
-// SubmitVideoMiora 提交一次 miora H3 文生视频任务，返回上游 upstreamTaskId。
+// MediaPayload miora 视频的图片载荷。字段名与上游 miora 代理逐字一致，
+// 且**恰含一个**：base64 / url / file_key（否则上游报 10005）。
 //
-// model 为空回落 MioraVideoModel（上游按 prompt 自动选，此处仅作占位）。
-// durationSec <= 0 时不带时长字段（上游默认）；带值时必须落在 4-15s。
-// resolution / aspectRatio 为空则不带（上游默认），带值必须命中白名单。
-func (c *Client) SubmitVideoMiora(ctx context.Context, a *auth.Auth, prompt, model string, durationSec int, resolution, aspectRatio string) (string, error) {
-	if strings.TrimSpace(prompt) == "" {
+// 为方便网关调用方，反序列化额外接受**字符串简写**（见 UnmarshalJSON）：
+//   - "https://…" / "http://…"       → {url}
+//   - "data:image/png;base64,AAAA…"  → {base64:"AAAA…"}（提交前剥离 data URI 前缀）
+//   - 其他（裸 base64 串）            → {base64}
+// file_key 无可靠字面前缀可辨，故**只**支持对象形态 {"file_key":"…"} 显式传入。
+type MediaPayload struct {
+	Base64  string `json:"base64,omitempty"`
+	URL     string `json:"url,omitempty"`
+	FileKey string `json:"file_key,omitempty"`
+}
+
+// UnmarshalJSON 支持字符串简写（URL / data URI / 裸 base64）与对象形态两种输入。
+func (p *MediaPayload) UnmarshalJSON(b []byte) error {
+	if strings.HasPrefix(strings.TrimSpace(string(b)), `"`) {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		s = strings.TrimSpace(s)
+		switch {
+		case s == "":
+			// 空串：留空载荷，由 normalized() 统一判为「缺少字段」。
+		case strings.HasPrefix(s, "http://"), strings.HasPrefix(s, "https://"):
+			p.URL = s
+		default: // data URI / 裸 base64，均由 normalized() 归一与校验。
+			p.Base64 = s
+		}
+		return nil
+	}
+	// 对象形态：用别名类型避免递归调用本方法。
+	type plain MediaPayload
+	var raw plain
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*p = MediaPayload(raw)
+	return nil
+}
+
+// normalized 归一载荷并校验「恰含一个字段」，返回可直接放进上游请求体的副本。
+func (p MediaPayload) normalized() (MediaPayload, error) {
+	q := MediaPayload{
+		Base64:  strings.TrimSpace(p.Base64),
+		URL:     strings.TrimSpace(p.URL),
+		FileKey: strings.TrimSpace(p.FileKey),
+	}
+	// data URI → 裸 base64（上游 base64 字段要的是裸串，不带 "data:…;base64," 前缀）。
+	if strings.HasPrefix(q.Base64, "data:") {
+		if i := strings.IndexByte(q.Base64, ','); i >= 0 {
+			q.Base64 = strings.TrimSpace(q.Base64[i+1:])
+		}
+	}
+	n := 0
+	for _, v := range []string{q.Base64, q.URL, q.FileKey} {
+		if v != "" {
+			n++
+		}
+	}
+	if n != 1 {
+		return MediaPayload{}, &Error{Kind: ErrBadParams, Status: http.StatusBadRequest,
+			Msg: "miora image payload requires exactly one of: base64, url, file_key"}
+	}
+	return q, nil
+}
+
+// MioraVideoRequest 一次 miora H3 视频提交的全部入参。
+//
+// 三种模式按输入字段自动择一（互斥，本地强校验，防上游静默降级）：
+//   - FirstFrame 非 nil      → 首尾帧模式（frame_to_video）；LastFrame 可选。
+//   - ReferenceImages 非 nil → 参考生模式（reference_to_video）；数组须非空。
+//   - 两者皆 nil             → 文生视频模式（不带 input）。
+//   - 两者同时非 nil         → ErrBadParams（语义不明确）。
+//
+// ReferenceImages 用**指针**：nil=未提供（文生），非 nil 空数组=「提供了但为空」，
+// 必须报错，而不是被上游当成文生视频静默出片。
+type MioraVideoRequest struct {
+	Prompt          string
+	Model           string
+	DurationSec     int
+	Resolution      string
+	AspectRatio     string
+	FirstFrame      *MediaPayload
+	LastFrame       *MediaPayload
+	ReferenceImages *[]MediaPayload
+}
+
+// buildInput 依据输入字段构造上游 input 对象；返回 (nil, nil) 表示文生（不带 input）。
+func (r MioraVideoRequest) buildInput() (map[string]any, error) {
+	hasFrame := r.FirstFrame != nil || r.LastFrame != nil
+	hasRef := r.ReferenceImages != nil
+	switch {
+	case hasFrame && hasRef:
+		return nil, &Error{Kind: ErrBadParams, Status: http.StatusBadRequest,
+			Msg: "miora: specify either first_frame/last_frame or references, not both"}
+	case hasRef:
+		refs := *r.ReferenceImages
+		if len(refs) == 0 {
+			return nil, &Error{Kind: ErrBadParams, Status: http.StatusBadRequest,
+				Msg: "miora: references must contain at least one image"}
+		}
+		out := make([]MediaPayload, 0, len(refs))
+		for _, ref := range refs {
+			n, err := ref.normalized()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, n)
+		}
+		return map[string]any{"reference_images": out}, nil
+	case hasFrame:
+		if r.FirstFrame == nil {
+			return nil, &Error{Kind: ErrBadParams, Status: http.StatusBadRequest,
+				Msg: "miora: first_frame is required for frame_to_video"}
+		}
+		first, err := r.FirstFrame.normalized()
+		if err != nil {
+			return nil, err
+		}
+		input := map[string]any{"first_frame_image": first}
+		if r.LastFrame != nil {
+			last, err := r.LastFrame.normalized()
+			if err != nil {
+				return nil, err
+			}
+			input["last_frame_image"] = last
+		}
+		return input, nil
+	default:
+		return nil, nil
+	}
+}
+
+// SubmitVideoMiora 提交一次 miora H3 视频任务（文生/首尾帧/参考生），返回上游 upstreamTaskId。
+//
+// Model 为空回落 MioraVideoModel（上游按 prompt 自动选，此处仅作占位）。
+// DurationSec <= 0 时不带时长字段（上游默认）；带值时必须落在 4-15s。
+// Resolution / AspectRatio 为空则不带（上游默认），带值必须命中白名单。
+// 首尾帧/参考图见 MioraVideoRequest（本地强校验，杜绝空 input 静默降级成文生）。
+func (c *Client) SubmitVideoMiora(ctx context.Context, a *auth.Auth, req MioraVideoRequest) (string, error) {
+	prompt := strings.TrimSpace(req.Prompt)
+	if prompt == "" {
 		return "", &Error{Kind: ErrBadParams, Status: http.StatusBadRequest, Msg: "prompt is required"}
 	}
-	if strings.TrimSpace(model) == "" {
-		model = MioraVideoModel
+	if strings.TrimSpace(req.Model) == "" {
+		req.Model = MioraVideoModel
 	}
-	_ = model // 上游按 prompt 选模型，model 仅作目录标识，不入请求体。
+	_ = req.Model // 上游按 prompt 选模型，Model 仅作目录标识，不入请求体。
 
-	body := map[string]any{"prompt": strings.TrimSpace(prompt)}
-	if durationSec > 0 {
-		if durationSec < mioraDurationMin || durationSec > mioraDurationMax {
+	body := map[string]any{"prompt": prompt}
+	if req.DurationSec > 0 {
+		if req.DurationSec < mioraDurationMin || req.DurationSec > mioraDurationMax {
 			return "", &Error{Kind: ErrBadParams, Status: http.StatusBadRequest,
-				Msg: fmt.Sprintf("miora video duration must be %d-%d seconds, got %d", mioraDurationMin, mioraDurationMax, durationSec)}
+				Msg: fmt.Sprintf("miora video duration must be %d-%d seconds, got %d", mioraDurationMin, mioraDurationMax, req.DurationSec)}
 		}
-		body["duration"] = durationSec
+		body["duration"] = req.DurationSec
 	}
-	if r := strings.TrimSpace(resolution); r != "" {
+	if r := strings.TrimSpace(req.Resolution); r != "" {
 		norm := strings.ToUpper(r)
 		if _, ok := mioraResolutions[norm]; !ok {
 			return "", &Error{Kind: ErrBadParams, Status: http.StatusBadRequest,
@@ -234,12 +419,19 @@ func (c *Client) SubmitVideoMiora(ctx context.Context, a *auth.Auth, prompt, mod
 		}
 		body["resolution"] = norm
 	}
-	if ar := strings.TrimSpace(aspectRatio); ar != "" {
+	if ar := strings.TrimSpace(req.AspectRatio); ar != "" {
 		if _, ok := mioraAspectRatios[strings.ToLower(ar)]; !ok {
 			return "", &Error{Kind: ErrBadParams, Status: http.StatusBadRequest,
 				Msg: "unsupported aspect_ratio " + ar + ", supported values: [adaptive 21:9 16:9 4:3 1:1 3:4 9:16]"}
 		}
 		body["aspect_ratio"] = ar
+	}
+	input, err := req.buildInput()
+	if err != nil {
+		return "", err
+	}
+	if input != nil {
+		body["input"] = input
 	}
 
 	ck, err := c.signClientTempKey(ctx, a)

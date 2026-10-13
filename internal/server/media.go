@@ -22,8 +22,12 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// mediaMaxBodyBytes 媒体请求体上限（prompt 文本很小，1MB 足够）。
+// mediaMaxBodyBytes 生图请求体上限（prompt 文本很小，1MB 足够）。
 const mediaMaxBodyBytes = 1 << 20
+
+// videoMaxBodyBytes 生视频请求体上限。首尾帧/参考生可内联 base64 图片（data URI 或裸串），
+// 一张 2K 图编码后约数 MB，24MB 可容纳数张；生图仍用更严的 1MB。
+const videoMaxBodyBytes = 24 << 20
 
 // mediaTimeout 单次媒体上游调用的总时长上限。
 // 生图实测数秒；视频提交/查询都是短请求（产物由上游异步产出），30s 足够。
@@ -46,7 +50,7 @@ type imageRequest struct {
 }
 
 func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
-	body, ok := h.readMediaBody(w, r, "image")
+	body, ok := h.readMediaBody(w, r, "image", mediaMaxBodyBytes)
 	if !ok {
 		return
 	}
@@ -120,6 +124,13 @@ type mediaImagePayload struct {
 // ---------------------------------------------------------------------------
 
 // videoRequest OpenAI 风格生视频入参（vendor/model/duration/resolution/aspect_ratio 为上游扩展字段）。
+//
+// miora H3 扩展（仅 cn:miora-* 生效，见 videosGenerations 的通道校验）：
+//   - first_frame / last_frame：首尾帧图生视频（frame_to_video），首帧必填；
+//   - references              ：多参考图生视频（reference_to_video），数组须非空。
+// 三者取值可为字符串（http(s) URL / data URI / 裸 base64）或对象
+// {"base64":…|"url":…|"file_key":…}，与上游 MediaPayload 同形（见 upstream.MediaPayload）。
+// References 用指针以区分「未提供（文生）」与「提供了空数组（应报错）」。
 type videoRequest struct {
 	Model       string `json:"model"`
 	Prompt      string `json:"prompt"`
@@ -127,10 +138,19 @@ type videoRequest struct {
 	Duration    int    `json:"duration"` // 秒
 	Resolution  string `json:"resolution"`
 	AspectRatio string `json:"aspect_ratio"`
+
+	FirstFrame *upstream.MediaPayload   `json:"first_frame"`
+	LastFrame  *upstream.MediaPayload   `json:"last_frame"`
+	References *[]upstream.MediaPayload `json:"references"`
+}
+
+// hasMioraVisualInput 报告请求是否携带 miora 专属的帧/参考图入参。
+func (req videoRequest) hasMioraVisualInput() bool {
+	return req.FirstFrame != nil || req.LastFrame != nil || req.References != nil
 }
 
 func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
-	body, ok := h.readMediaBody(w, r, "video")
+	body, ok := h.readMediaBody(w, r, "video", videoMaxBodyBytes)
 	if !ok {
 		return
 	}
@@ -151,6 +171,14 @@ func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	channel := videoJobVendor(vendor)
 
+	// 首尾帧/参考生是 miora H3 专属模式；Kling（tcproxy）不接受这些字段，
+	// 静默忽略会让调用方误以为图生视频生效，故本地直接拒绝。
+	if req.hasMioraVisualInput() && channel != videoChannelMiora {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"first_frame/last_frame/references are only supported by cn:miora-* models")
+		return
+	}
+
 	type submitResult struct {
 		JobID   string
 		UID     string
@@ -160,7 +188,16 @@ func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
 		var jobID string
 		var err error
 		if channel == videoChannelMiora {
-			jobID, err = h.cfg.Upstream.SubmitVideoMiora(ctx, a, req.Prompt, model, req.Duration, req.Resolution, req.AspectRatio)
+			jobID, err = h.cfg.Upstream.SubmitVideoMiora(ctx, a, upstream.MioraVideoRequest{
+				Prompt:          req.Prompt,
+				Model:           model,
+				DurationSec:     req.Duration,
+				Resolution:      req.Resolution,
+				AspectRatio:     req.AspectRatio,
+				FirstFrame:      req.FirstFrame,
+				LastFrame:       req.LastFrame,
+				ReferenceImages: req.References,
+			})
 		} else {
 			jobID, err = h.cfg.Upstream.SubmitVideo(ctx, a, req.Prompt, vendor, model, req.Duration)
 		}
@@ -331,15 +368,15 @@ func (v *videoJobRegistry) evictLocked() {
 // ---------------------------------------------------------------------------
 
 // readMediaBody 读取并校验媒体请求体，超限/读失败直接写响应并返回 ok=false。
-func (h *Handler) readMediaBody(w http.ResponseWriter, r *http.Request, kind string) ([]byte, bool) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, mediaMaxBodyBytes+1))
+func (h *Handler) readMediaBody(w http.ResponseWriter, r *http.Request, kind string, limit int64) ([]byte, bool) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return nil, false
 	}
-	if len(body) > mediaMaxBodyBytes {
+	if int64(len(body)) > limit {
 		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_body_too_large",
-			fmt.Sprintf("%s 请求体超过 %d KB 上限", kind, mediaMaxBodyBytes>>10))
+			fmt.Sprintf("%s 请求体超过 %d KB 上限", kind, limit>>10))
 		return nil, false
 	}
 	return body, true

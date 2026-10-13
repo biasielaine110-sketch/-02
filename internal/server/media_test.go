@@ -333,3 +333,62 @@ func TestMediaModelEntriesInCatalog(t *testing.T) {
 		t.Errorf("missing media entries: %v", want)
 	}
 }
+
+// TestVideosGenerationsMioraFrameFlow 首尾帧模式：字符串/对象两种帧取值都落到上游 input。
+func TestVideosGenerationsMioraFrameFlow(t *testing.T) {
+	rec := &mediaRecorder{}
+	h := mediaHandler(t, rec)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, authedReq("POST", "/v1/videos/generations",
+		`{"model":"cn:miora-minimax-h3","prompt":"morph","duration":5,`+
+			`"first_frame":"https://x/a.png","last_frame":{"base64":"data:image/png;base64,QQ=="}}`))
+	if rr.Code != 200 {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rec.mioraSubmit, `"first_frame_image":{"url":"https://x/a.png"}`) {
+		t.Errorf("first frame not forwarded: %s", rec.mioraSubmit)
+	}
+	// data URI 前缀应被剥离成裸 base64。
+	if !strings.Contains(rec.mioraSubmit, `"last_frame_image":{"base64":"QQ=="}`) {
+		t.Errorf("last frame not normalized: %s", rec.mioraSubmit)
+	}
+}
+
+// TestVideosGenerationsMioraReferenceFlow 参考生模式：数组逐项转成 MediaPayload。
+func TestVideosGenerationsMioraReferenceFlow(t *testing.T) {
+	rec := &mediaRecorder{}
+	h := mediaHandler(t, rec)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, authedReq("POST", "/v1/videos/generations",
+		`{"model":"cn:miora-minimax-h3","prompt":"x","references":["https://x/1.png","https://x/2.png"]}`))
+	if rr.Code != 200 {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rec.mioraSubmit, `"reference_images":[{"url":"https://x/1.png"},{"url":"https://x/2.png"}]`) {
+		t.Errorf("references not forwarded: %s", rec.mioraSubmit)
+	}
+}
+
+// TestVideosGenerationsMioraVisualValidation 非法图入参本地拦截（不发上游）：
+// 空参考数组 / 缺首帧 / 空载荷 / 两种模式并存 / 非 miora 通道携带帧字段。
+func TestVideosGenerationsMioraVisualValidation(t *testing.T) {
+	cases := []string{
+		`{"model":"cn:miora-minimax-h3","prompt":"x","references":[]}`,
+		`{"model":"cn:miora-minimax-h3","prompt":"x","last_frame":"https://x/a.png"}`,
+		`{"model":"cn:miora-minimax-h3","prompt":"x","first_frame":{}}`,
+		`{"model":"cn:miora-minimax-h3","prompt":"x","first_frame":"https://x/a.png","references":["https://x/1.png"]}`,
+		`{"model":"cn:kling-v2.6","prompt":"x","first_frame":"https://x/a.png"}`,
+	}
+	for _, body := range cases {
+		rec := &mediaRecorder{}
+		h := mediaHandler(t, rec)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, authedReq("POST", "/v1/videos/generations", body))
+		if rr.Code != 400 {
+			t.Errorf("body=%s code=%d want 400 (resp=%s)", body, rr.Code, rr.Body.String())
+		}
+		if rec.mioraSubmit != "" || rec.submitRaw != "" {
+			t.Errorf("body=%s should be rejected locally, but upstream saw a submit", body)
+		}
+	}
+}

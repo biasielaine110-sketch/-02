@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -45,7 +46,9 @@ func TestSubmitVideoMiora(t *testing.T) {
 		"", rec)
 	a := &auth.Auth{UID: "u1", AccessToken: "at1"}
 
-	id, err := c.SubmitVideoMiora(context.Background(), a, "a cat on a skateboard", "", 6, "768p", "16:9")
+	id, err := c.SubmitVideoMiora(context.Background(), a, MioraVideoRequest{
+		Prompt: "a cat on a skateboard", DurationSec: 6, Resolution: "768p", AspectRatio: "16:9",
+	})
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
@@ -57,6 +60,10 @@ func TestSubmitVideoMiora(t *testing.T) {
 		if !strings.Contains(rec.submit, want) {
 			t.Errorf("submit body %s missing %s", rec.submit, want)
 		}
+	}
+	// 文生模式不得携带 input（带上会被上游按图生视频解析）。
+	if strings.Contains(rec.submit, `"input"`) {
+		t.Errorf("text-mode submit body must not carry input: %s", rec.submit)
 	}
 	// ck_t_ 签发用的是 accessToken。
 	if !strings.Contains(rec.apiKey, `"temporary":true`) || !strings.Contains(rec.apiKey, `"name":"workbuddy-connect-cloud-service"`) {
@@ -82,7 +89,9 @@ func TestSubmitVideoMioraValidation(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := c.SubmitVideoMiora(ctx, a, tc.prompt, "", tc.duration, tc.resolution, tc.aspect)
+			_, err := c.SubmitVideoMiora(ctx, a, MioraVideoRequest{
+				Prompt: tc.prompt, DurationSec: tc.duration, Resolution: tc.resolution, AspectRatio: tc.aspect,
+			})
 			var uerr *Error
 			if !errors.As(err, &uerr) || uerr.Kind != ErrBadParams {
 				t.Fatalf("err=%v want ErrBadParams", err)
@@ -160,12 +169,14 @@ func TestMioraEnvelopeErrorMatchesCode(t *testing.T) {
 		{"business fail (prompt missing)", `{"code":"UPSTREAM_SUBMIT_FAILED","failed":true,"data":null,"message":"upstream video-submit failed: status=400 code=10001 msg=Create video failed with error: TokenHub MiniMax H3 requires prompt","httpStatus":502}`, ErrBadParams},
 		{"auth fail string code", `{"code":"AUTH_MISSING_TEMP_KEY","data":null,"message":"缺少 Authorization Bearer","httpStatus":401}`, ErrAccountFault},
 		{"content blocked", `{"code":"CONTENT_SAFETY","failed":true,"data":null,"message":"content safety rejected","httpStatus":400}`, ErrContentBlocked},
+		// 媒体校验错误：code=10005 + message 是**字符串数组**（实测上游形态），必须能解析且归为参数错误。
+		{"validation array message", `{"code":10005,"failed":true,"data":null,"message":["input.first_frame_image.MediaPayload requires exactly one of: base64, url, file_key"],"httpStatus":400}`, ErrBadParams},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c := mioraTestClient(t, tc.body, "", nil)
 			a := &auth.Auth{UID: "u1", AccessToken: "at1"}
-			_, err := c.SubmitVideoMiora(context.Background(), a, "a prompt", "", 0, "", "")
+			_, err := c.SubmitVideoMiora(context.Background(), a, MioraVideoRequest{Prompt: "a prompt"})
 			var uerr *Error
 			if !errors.As(err, &uerr) {
 				t.Fatalf("err=%v want *Error", err)
@@ -199,6 +210,151 @@ func TestMioraVideoStatus(t *testing.T) {
 	for in, want := range cases {
 		if got := mioraVideoStatus(in); got != want {
 			t.Errorf("mioraVideoStatus(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+// TestMediaPayloadUnmarshal 字符串简写（URL / data URI / 裸 base64）与对象形态都要能解。
+func TestMediaPayloadUnmarshal(t *testing.T) {
+	cases := []struct {
+		in   string
+		want MediaPayload
+	}{
+		{`"https://x/a.png"`, MediaPayload{URL: "https://x/a.png"}},
+		{`"http://x/a.png"`, MediaPayload{URL: "http://x/a.png"}},
+		{`"data:image/png;base64,QQ=="`, MediaPayload{Base64: "data:image/png;base64,QQ=="}},
+		{`"QUJD"`, MediaPayload{Base64: "QUJD"}},
+		{`{"url":"https://x/b.png"}`, MediaPayload{URL: "https://x/b.png"}},
+		{`{"base64":"ZZZ"}`, MediaPayload{Base64: "ZZZ"}},
+		{`{"file_key":"bga/xyz"}`, MediaPayload{FileKey: "bga/xyz"}},
+	}
+	for _, tc := range cases {
+		var p MediaPayload
+		if err := json.Unmarshal([]byte(tc.in), &p); err != nil {
+			t.Fatalf("unmarshal %s: %v", tc.in, err)
+		}
+		if p != tc.want {
+			t.Errorf("unmarshal %s = %+v want %+v", tc.in, p, tc.want)
+		}
+	}
+}
+
+// TestMediaPayloadNormalized data URI 剥离 + 「恰含一个字段」校验。
+func TestMediaPayloadNormalized(t *testing.T) {
+	got, err := (MediaPayload{Base64: "data:image/png;base64,QUJD"}).normalized()
+	if err != nil {
+		t.Fatalf("normalized: %v", err)
+	}
+	if got.Base64 != "QUJD" || got.URL != "" || got.FileKey != "" {
+		t.Fatalf("data URI not stripped: %+v", got)
+	}
+	for _, bad := range []MediaPayload{{}, {Base64: "a", URL: "b"}, {Base64: "  "}, {URL: "u", FileKey: "f"}} {
+		if _, err := bad.normalized(); err == nil {
+			t.Errorf("payload %+v should be rejected", bad)
+		}
+	}
+}
+
+// TestMioraBuildInput 三种模式的 input 构造与本地强校验（防「空 input 静默降级成文生」）。
+func TestMioraBuildInput(t *testing.T) {
+	first := MediaPayload{URL: "https://x/a.png"}
+	last := MediaPayload{Base64: "data:image/png;base64,QQ=="}
+	refs := []MediaPayload{{URL: "https://x/1.png"}, {URL: "https://x/2.png"}}
+	empty := []MediaPayload{}
+
+	cases := []struct {
+		name    string
+		req     MioraVideoRequest
+		wantKey string // 期望 input 含该键；空串表示应为文生（input == nil）
+		wantErr bool
+	}{
+		{"text mode (no input)", MioraVideoRequest{Prompt: "p"}, "", false},
+		{"frame first only", MioraVideoRequest{Prompt: "p", FirstFrame: &first}, "first_frame_image", false},
+		{"frame first+last", MioraVideoRequest{Prompt: "p", FirstFrame: &first, LastFrame: &last}, "last_frame_image", false},
+		{"frame last only lacks first", MioraVideoRequest{Prompt: "p", LastFrame: &last}, "", true},
+		{"frame empty payload", MioraVideoRequest{Prompt: "p", FirstFrame: &MediaPayload{}}, "", true},
+		{"reference ok", MioraVideoRequest{Prompt: "p", ReferenceImages: &refs}, "reference_images", false},
+		{"reference empty slice", MioraVideoRequest{Prompt: "p", ReferenceImages: &empty}, "", true},
+		{"reference with empty item", MioraVideoRequest{Prompt: "p", ReferenceImages: &[]MediaPayload{{}}}, "", true},
+		{"frame + reference conflict", MioraVideoRequest{Prompt: "p", FirstFrame: &first, ReferenceImages: &refs}, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input, err := tc.req.buildInput()
+			if tc.wantErr {
+				var uerr *Error
+				if !errors.As(err, &uerr) || uerr.Kind != ErrBadParams {
+					t.Fatalf("err=%v want ErrBadParams", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if tc.wantKey == "" {
+				if input != nil {
+					t.Fatalf("want nil input (text mode), got %v", input)
+				}
+				return
+			}
+			if _, ok := input[tc.wantKey]; !ok {
+				t.Fatalf("input %v missing key %q", input, tc.wantKey)
+			}
+		})
+	}
+}
+
+// TestSubmitVideoMioraFrameBody 首尾帧模式：input.first_frame_image / last_frame_image 落到请求体。
+func TestSubmitVideoMioraFrameBody(t *testing.T) {
+	rec := &struct{ submit, query, apiKey string }{}
+	c := mioraTestClient(t, `{"code":0,"failed":false,"data":{"upstreamTaskId":"t-fr"}}`, "", rec)
+	a := &auth.Auth{UID: "u1", AccessToken: "at1"}
+	first := MediaPayload{URL: "https://x/first.png"}
+	last := MediaPayload{Base64: "data:image/jpeg;base64,ZZZ"}
+	id, err := c.SubmitVideoMiora(context.Background(), a, MioraVideoRequest{
+		Prompt: "morph", DurationSec: 5, FirstFrame: &first, LastFrame: &last,
+	})
+	if err != nil || id != "t-fr" {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+	for _, want := range []string{
+		`"input":{`,
+		`"first_frame_image":{"url":"https://x/first.png"}`,
+		`"last_frame_image":{"base64":"ZZZ"}`,
+	} {
+		if !strings.Contains(rec.submit, want) {
+			t.Errorf("submit body %s missing %s", rec.submit, want)
+		}
+	}
+}
+
+// TestSubmitVideoMioraReferenceBody 参考生模式：input.reference_images 数组落到请求体。
+func TestSubmitVideoMioraReferenceBody(t *testing.T) {
+	rec := &struct{ submit, query, apiKey string }{}
+	c := mioraTestClient(t, `{"code":0,"failed":false,"data":{"upstreamTaskId":"t-ref"}}`, "", rec)
+	a := &auth.Auth{UID: "u1", AccessToken: "at1"}
+	refs := []MediaPayload{{URL: "https://x/1.png"}, {URL: "https://x/2.png"}}
+	id, err := c.SubmitVideoMiora(context.Background(), a, MioraVideoRequest{Prompt: "x", DurationSec: 6, ReferenceImages: &refs})
+	if err != nil || id != "t-ref" {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+	if !strings.Contains(rec.submit, `"reference_images":[{"url":"https://x/1.png"},{"url":"https://x/2.png"}]`) {
+		t.Errorf("submit body=%s", rec.submit)
+	}
+}
+
+// TestMioraMessageText message 字符串/数组两种形态都要能压成文本。
+func TestMioraMessageText(t *testing.T) {
+	cases := map[string]string{
+		`"boom"`:       "boom",
+		`["a","b"]`:    "a; b",
+		`["single"]`:   "single",
+		`"  padded  "`: "padded",
+		``:             "",
+	}
+	for in, want := range cases {
+		if got := mioraMessageText(json.RawMessage(in)); got != want {
+			t.Errorf("mioraMessageText(%s)=%q want %q", in, got, want)
 		}
 	}
 }
