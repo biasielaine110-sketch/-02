@@ -578,6 +578,10 @@ type Client struct {
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
 
+	// MioraBase miora（MiniMax H3）视频代理基址；空 = 内置默认 public.miora.qq.com。
+	// 注意与 ck_t_ 签发域分离：签发走 chatBase（/v2/api-keys），媒体走 MioraBase。
+	MioraBase string
+
 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
 	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
 	ChatBaseGlobal    string

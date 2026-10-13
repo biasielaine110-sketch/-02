@@ -19,11 +19,19 @@ type mediaRecorder struct {
 	tcAuth    string
 	submitRaw string
 	queryRaw  string
+
+	// miora 通道
+	apiKeyAuth    string
+	mioraAuth     string
+	mioraSubmit   string
+	mioraQueryRaw string
 }
 
 // mediaFakeUpstream 按路径 + X-TC-Action 路由的假上游：
-//   - /v2/images/generations → 生图信封（code=0 + data.data[].url）
-//   - /agenttool/v1/tcproxy  → 视频提交/查询（TC3 签名头 + Response 包裹）
+//   - /v2/images/generations              → 生图信封（code=0 + data.data[].url）
+//   - /agenttool/v1/tcproxy               → 视频提交/查询（TC3 签名头 + Response 包裹）
+//   - /v2/api-keys                        → miora 的 ck_t_ 临时密钥签发
+//   - /api/ai/workbuddy-proxy/video/*     → miora（MiniMax H3）视频提交/查询
 func mediaFakeUpstream(t *testing.T, rec *mediaRecorder) *upstream.Client {
 	t.Helper()
 	return &upstream.Client{
@@ -37,6 +45,10 @@ func mediaFakeUpstream(t *testing.T, rec *mediaRecorder) *upstream.Client {
 				rec.imageAuth = r.Header.Get("Authorization")
 				status = 200
 				body = `{"code":0,"msg":"","data":{"created":1,"data":[{"url":"https://cos.example/a.png","revised_prompt":"a cat"}],"usage":{"total_tokens":12,"credit":5.71}}}`
+			case strings.HasSuffix(r.URL.Path, "/v2/api-keys"):
+				rec.apiKeyAuth = r.Header.Get("Authorization")
+				status = 200
+				body = `{"code":0,"msg":"OK","data":{"key":"ck_t_test.abc","expires_at":"2026-10-13T23:00:00+08:00"}}`
 			case strings.HasSuffix(r.URL.Path, "/agenttool/v1/tcproxy"):
 				rec.tcAuth = r.Header.Get("Authorization")
 				switch r.Header.Get("X-TC-Action") {
@@ -51,6 +63,16 @@ func mediaFakeUpstream(t *testing.T, rec *mediaRecorder) *upstream.Client {
 				default:
 					status, body = 400, `{"Response":{"Error":{"Code":"InvalidAction"}}}`
 				}
+			case strings.HasSuffix(r.URL.Path, "/api/ai/workbuddy-proxy/video/submit"):
+				rec.mioraAuth = r.Header.Get("Authorization")
+				rec.mioraSubmit = string(raw)
+				status = 200
+				body = `{"code":0,"failed":false,"data":{"upstreamTaskId":"miora-task-1","model":"minimax-h3-iOA","provider":"copilot-video"},"message":"successful","httpStatus":200}`
+			case strings.HasSuffix(r.URL.Path, "/api/ai/workbuddy-proxy/video/query-task"):
+				rec.mioraAuth = r.Header.Get("Authorization")
+				rec.mioraQueryRaw = string(raw)
+				status = 200
+				body = `{"code":0,"failed":false,"data":{"miora-task-1":{"status":"completed","resultFiles":[{"signedUrl":"https://cos.example/miora.mp4","mimeType":"video/mp4"}]}},"message":"successful","httpStatus":200}`
 			default:
 				status, body = 404, `no route`
 			}
@@ -62,6 +84,7 @@ func mediaFakeUpstream(t *testing.T, rec *mediaRecorder) *upstream.Client {
 		})},
 		ChatBaseCN:    "https://fake.example",
 		BillingBaseCN: "https://fake.example",
+		MioraBase:     "https://miora.example",
 	}
 }
 
@@ -196,6 +219,9 @@ func TestParseVideoModel(t *testing.T) {
 		{"kling-v2.6", "Kling", "v2.6"},
 		{"Kling-2.0", "Kling", "2.0"},
 		{"kling", "Kling", ""},
+		{"miora-minimax-h3", "Miora", "minimax-h3"},
+		{"MIORA-minimax-h3", "Miora", "minimax-h3"},
+		{"miora", "Miora", ""},
 		{"v2.6", "", "v2.6"},
 		{"", "", ""},
 		{"  kling-v2.6  ", "Kling", "v2.6"},
@@ -208,15 +234,92 @@ func TestParseVideoModel(t *testing.T) {
 	}
 }
 
+// TestVideosGenerationsMioraFlow miora（MiniMax H3）异步链路：
+// 目录 ID → vendor 路由 → 自签 ck_t_ → 提交取 upstreamTaskId → 查询取产物。
+func TestVideosGenerationsMioraFlow(t *testing.T) {
+	rec := &mediaRecorder{}
+	h := mediaHandler(t, rec)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, authedReq("POST", "/v1/videos/generations",
+		`{"model":"cn:miora-minimax-h3","prompt":"a dog","duration":6,"resolution":"768p","aspect_ratio":"16:9"}`))
+	if rr.Code != 200 {
+		t.Fatalf("submit code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var sub struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &sub)
+	if sub.ID != "miora-task-1" || sub.Status != "submitted" {
+		t.Fatalf("submit resp=%+v", sub)
+	}
+	// 提交体：prompt/duration/resolution(归一为大写)/aspect_ratio 四项。
+	if !strings.Contains(rec.mioraSubmit, `"prompt":"a dog"`) ||
+		!strings.Contains(rec.mioraSubmit, `"duration":6`) ||
+		!strings.Contains(rec.mioraSubmit, `"resolution":"768P"`) ||
+		!strings.Contains(rec.mioraSubmit, `"aspect_ratio":"16:9"`) {
+		t.Errorf("miora submit body=%s", rec.mioraSubmit)
+	}
+	// 鉴权：先签 ck_t_（用账号 accessToken），媒体端点用 ck_t_。
+	if rec.apiKeyAuth != "Bearer at1" {
+		t.Errorf("api-keys auth=%q", rec.apiKeyAuth)
+	}
+	if rec.mioraAuth != "Bearer ck_t_test.abc" {
+		t.Errorf("miora auth=%q", rec.mioraAuth)
+	}
+
+	// 查询（走 miora 后端）
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, authedReq("GET", "/v1/videos/generations/miora-task-1", ""))
+	if rr2.Code != 200 {
+		t.Fatalf("query code=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	var q struct {
+		Status string `json:"status"`
+		URL    string `json:"url"`
+	}
+	json.Unmarshal(rr2.Body.Bytes(), &q)
+	if q.Status != "succeeded" || q.URL != "https://cos.example/miora.mp4" {
+		t.Fatalf("query resp=%+v", q)
+	}
+	if !strings.Contains(rec.mioraQueryRaw, `"upstreamTaskIds":["miora-task-1"]`) {
+		t.Errorf("miora query body=%s", rec.mioraQueryRaw)
+	}
+}
+
+// TestVideosGenerationsMioraValidation miora 规格闸门在本地拦截（省一次上游往返）。
+func TestVideosGenerationsMioraValidation(t *testing.T) {
+	cases := []string{
+		`{"model":"cn:miora-minimax-h3","prompt":"a dog","duration":2}`,         // 时长 < 4
+		`{"model":"cn:miora-minimax-h3","prompt":"a dog","duration":20}`,        // 时长 > 15
+		`{"model":"cn:miora-minimax-h3","prompt":"a dog","resolution":"999p"}`,  // 分辨率不在白名单
+		`{"model":"cn:miora-minimax-h3","prompt":"a dog","aspect_ratio":"5:4"}`, // 画幅不在白名单
+	}
+	for _, body := range cases {
+		rec := &mediaRecorder{}
+		h := mediaHandler(t, rec)
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, authedReq("POST", "/v1/videos/generations", body))
+		if rr.Code != 400 {
+			t.Errorf("body=%s code=%d want 400", body, rr.Code)
+		}
+		if rec.mioraSubmit != "" {
+			t.Errorf("body=%s should be rejected locally, but upstream saw submit", body)
+		}
+	}
+}
+
 // TestMediaModelEntriesInCatalog 媒体模型登记进 /v1/models 目录（带 type 标记）。
 func TestMediaModelEntriesInCatalog(t *testing.T) {
 	entries := mediaModelEntries()
-	if len(entries) != 2 {
-		t.Fatalf("want 2 media entries, got %d", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("want 3 media entries, got %d", len(entries))
 	}
 	want := map[string]string{
-		"cn:" + upstream.DefaultImageModel: "image",
+		"cn:" + upstream.DefaultImageModel:       "image",
 		"cn:kling-" + upstream.DefaultVideoModel: "video",
+		"cn:miora-" + upstream.MioraVideoModel:   "video",
 	}
 	for _, e := range entries {
 		id, _ := e["id"].(string)

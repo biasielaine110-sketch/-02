@@ -119,12 +119,14 @@ type mediaImagePayload struct {
 // 生视频 POST /v1/videos/generations（提交） + GET /v1/videos/generations/{id}（查询）
 // ---------------------------------------------------------------------------
 
-// videoRequest OpenAI 风格生视频入参（vendor/model/duration 为上游扩展字段）。
+// videoRequest OpenAI 风格生视频入参（vendor/model/duration/resolution/aspect_ratio 为上游扩展字段）。
 type videoRequest struct {
-	Model    string `json:"model"`
-	Prompt   string `json:"prompt"`
-	Vendor   string `json:"vendor"`
-	Duration int    `json:"duration"` // 秒
+	Model       string `json:"model"`
+	Prompt      string `json:"prompt"`
+	Vendor      string `json:"vendor"`
+	Duration    int    `json:"duration"` // 秒
+	Resolution  string `json:"resolution"`
+	AspectRatio string `json:"aspect_ratio"`
 }
 
 func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
@@ -142,29 +144,37 @@ func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	realm, bare := resolveModel(req.Model)
-	// 把目录 ID（如 "kling-v2.6"）解析成 vendor + model；显式 vendor 字段优先。
+	// 把目录 ID（如 "kling-v2.6" / "miora-minimax-h3"）解析成 vendor + model；显式 vendor 字段优先。
 	vendor, model := parseVideoModel(bare)
 	if strings.TrimSpace(req.Vendor) != "" {
 		vendor = strings.TrimSpace(req.Vendor)
 	}
+	channel := videoJobVendor(vendor)
 
 	type submitResult struct {
-		JobID string
-		UID   string
+		JobID   string
+		UID     string
+		Channel string
 	}
 	res, uerr := h.runMedia(w, r, realm, func(ctx context.Context, a *auth.Auth) (any, error) {
-		jobID, err := h.cfg.Upstream.SubmitVideo(ctx, a, req.Prompt, vendor, model, req.Duration)
+		var jobID string
+		var err error
+		if channel == videoChannelMiora {
+			jobID, err = h.cfg.Upstream.SubmitVideoMiora(ctx, a, req.Prompt, model, req.Duration, req.Resolution, req.AspectRatio)
+		} else {
+			jobID, err = h.cfg.Upstream.SubmitVideo(ctx, a, req.Prompt, vendor, model, req.Duration)
+		}
 		if err != nil {
 			return nil, err
 		}
-		return submitResult{JobID: jobID, UID: a.UID}, nil
+		return submitResult{JobID: jobID, UID: a.UID, Channel: channel}, nil
 	})
 	if uerr != nil {
 		h.writeMediaError(w, uerr)
 		return
 	}
 	sr := res.(submitResult)
-	videoJobs.put(sr.JobID, sr.UID)
+	videoJobs.put(sr.JobID, sr.UID, sr.Channel)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":         sr.JobID,
@@ -181,7 +191,7 @@ func (h *Handler) videosGenerationGet(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "job id is required")
 		return
 	}
-	uid, ok := videoJobs.get(jobID)
+	uid, channel, ok := videoJobs.get(jobID)
 	if !ok {
 		// 进程重启后任务表清空（进程内状态，不落盘）。
 		// 明确回报「未知任务」而不是编造状态：调用方需重新提交。
@@ -198,16 +208,22 @@ func (h *Handler) videosGenerationGet(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), mediaTimeout)
 	defer cancel()
-	job, err := h.cfg.Upstream.QueryVideo(ctx, acct, jobID)
+	var job *upstream.VideoJob
+	var err error
+	if channel == videoChannelMiora {
+		job, err = h.cfg.Upstream.QueryVideoMiora(ctx, acct, jobID)
+	} else {
+		job, err = h.cfg.Upstream.QueryVideo(ctx, acct, jobID)
+	}
 	if err != nil {
 		h.writeMediaError(w, err)
 		return
 	}
 
 	out := map[string]any{
-		"id":      job.JobID,
-		"object":  "video",
-		"status":  mediaVideoStatus(job),
+		"id":              job.JobID,
+		"object":          "video",
+		"status":          mediaVideoStatus(job),
 		"upstream_status": job.Status,
 	}
 	if job.ResultURL != "" {
@@ -237,17 +253,35 @@ func mediaVideoStatus(job *upstream.VideoJob) string {
 // 任务表（jobID -> 提交账号 uid）
 // ---------------------------------------------------------------------------
 
-// videoJobRegistry 记录任务归属账号，供 GET 查询时选回同一个号。
-// 为什么必须记账号：上游 DescribeAigcVideoJob 需要**提交该任务的账号**鉴权，
-// 换号查会取不到结果。进程内状态、重启即清（重启后查询回 job_not_found）。
+// videoJobRegistry 记录任务归属账号与通道，供 GET 查询时选回同一个号、走对后端。
+// 为什么必须记账号：上游查询（DescribeAigcVideoJob / miora query-task）需要
+// **提交该任务的账号**鉴权，换号查会取不到结果。
+// 为什么必须记通道：Kling 走 tcproxy、miora 走 workbuddy-proxy，两者的任务 ID
+// 互不通用，查错后端必然失败。
+// 进程内状态、重启即清（重启后查询回 job_not_found）。
 type videoJobRegistry struct {
 	mu    sync.Mutex
 	items map[string]videoJobEntry
 }
 
 type videoJobEntry struct {
-	uid string
-	at  time.Time
+	uid     string
+	channel string
+	at      time.Time
+}
+
+// 视频通道标识（存入任务表，查询时据此选后端）。
+const (
+	videoChannelKling = "kling"
+	videoChannelMiora = "miora"
+)
+
+// videoJobVendor 归一任务所属通道：miora → videoChannelMiora，其余（Kling/空）→ videoChannelKling。
+func videoJobVendor(vendor string) string {
+	if upstream.IsMioraVendor(vendor) {
+		return videoChannelMiora
+	}
+	return videoChannelKling
 }
 
 // videoJobTTL 任务表保留时长（上游产物 URL 约 7 天有效，这里留足重试窗口）。
@@ -258,24 +292,24 @@ const videoJobMaxItems = 4096
 
 var videoJobs = &videoJobRegistry{items: map[string]videoJobEntry{}}
 
-func (v *videoJobRegistry) put(jobID, uid string) {
+func (v *videoJobRegistry) put(jobID, uid, channel string) {
 	if jobID == "" {
 		return
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.evictLocked()
-	v.items[jobID] = videoJobEntry{uid: uid, at: time.Now()}
+	v.items[jobID] = videoJobEntry{uid: uid, channel: channel, at: time.Now()}
 }
 
-func (v *videoJobRegistry) get(jobID string) (string, bool) {
+func (v *videoJobRegistry) get(jobID string) (uid, channel string, ok bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	e, ok := v.items[jobID]
-	if !ok || time.Since(e.at) > videoJobTTL {
-		return "", false
+	e, found := v.items[jobID]
+	if !found || time.Since(e.at) > videoJobTTL {
+		return "", "", false
 	}
-	return e.uid, true
+	return e.uid, e.channel, true
 }
 
 // evictLocked 清过期项；仍超容量则整体重开（宁可丢旧任务也不无界增长）。
@@ -436,25 +470,29 @@ func fetchAsBase64(ctx context.Context, url string) (string, error) {
 
 // parseVideoModel 把生视频模型规格拆成 (vendor, model)。
 //
-// 支持的写法（大小写不敏感，厂商前缀部分）：
-//   - "kling-v2.6" → ("Kling", "v2.6")   —— /v1/models 目录里的规范 ID
-//   - "kling"      → ("Kling", "")       —— 只给厂商，版本回落上游默认
-//   - "v2.6"       → ("", "v2.6")        —— 只给版本，厂商回落默认
-//   - ""           → ("", "")            —— 全部回落默认（上游侧补默认）
+// 支持的写法（厂商前缀大小写不敏感）：
+//   - "kling-v2.6"        → ("Kling", "v2.6")     —— /v1/models 目录里的规范 ID
+//   - "miora-minimax-h3"  → ("Miora", "minimax-h3")
+//   - "kling"             → ("Kling", "")         —— 只给厂商，版本回落上游默认
+//   - "miora"             → ("Miora", "")
+//   - "v2.6"              → ("", "v2.6")          —— 只给版本，厂商回落默认（Kling）
+//   - ""                  → ("", "")              —— 全部回落默认（上游侧补默认）
 //
-// 意图：让客户端既能用目录里的单一 ID，也能按「厂商 + 版本」分字段传，
-// 二者都落到上游 SubmitVideo 认得的形态。
+// 厂商清单取自 upstream.VideoVendors()（Kling / Miora），避免两处硬编码漂移。
 func parseVideoModel(spec string) (vendor, model string) {
 	s := strings.TrimSpace(spec)
 	if s == "" {
 		return "", ""
 	}
 	lower := strings.ToLower(s)
-	if strings.HasPrefix(lower, upstream.VideoVendorPrefix()) {
-		return upstream.DefaultVideoVendor, s[len(upstream.VideoVendorPrefix()):]
-	}
-	if lower == strings.ToLower(upstream.DefaultVideoVendor) {
-		return upstream.DefaultVideoVendor, ""
+	for _, v := range upstream.VideoVendors() {
+		prefix := strings.ToLower(v) + "-"
+		if strings.HasPrefix(lower, prefix) {
+			return v, s[len(prefix):]
+		}
+		if lower == strings.ToLower(v) {
+			return v, ""
+		}
 	}
 	// 无厂商前缀：视为裸版本号，厂商回落默认。
 	return "", s
