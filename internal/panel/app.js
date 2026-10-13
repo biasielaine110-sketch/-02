@@ -336,6 +336,8 @@ async function loadModels() {
       if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
       if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
       if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+      // 多模态（生图/生视频）为网关本地登记项，用类型徽标区分，避免与 chat 模型混淆。
+      if (m.media) caps.push('<span class="tag ok">' + (m.type === 'image' ? '生图' : '生视频') + '</span>');
       const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
       const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
       return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +

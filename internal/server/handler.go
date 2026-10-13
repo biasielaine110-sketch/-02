@@ -145,6 +145,11 @@ func NewHandler(cfg Config) *Handler {
 	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	// 多模态：生图（同步）+ 生视频（异步提交 + 轮询），见 media.go。
+	// 与 chat 共用账号池与 Bearer 鉴权，但惩罚策略独立（不喂 chat 的软冷却）。
+	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(h.imagesGenerations))
+	h.mux.HandleFunc("POST /v1/videos/generations", h.withAuth(h.videosGenerations))
+	h.mux.HandleFunc("GET /v1/videos/generations/{id}", h.withAuth(h.videosGenerationGet))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
@@ -397,6 +402,9 @@ func (h *Handler) modelList() []map[string]any {
 			out = append(out, entry)
 		}
 	}
+	// 多模态目录（生图/生视频）：网关本地登记，与 chat 模型同走 cn: 前缀协议。
+	// 见 media.go mediaModelEntries —— 两类模型不在上游 chat 列表里，静态登记供发现。
+	out = append(out, mediaModelEntries()...)
 	return out
 }
 

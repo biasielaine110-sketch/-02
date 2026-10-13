@@ -1,0 +1,232 @@
+package server
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+)
+
+// mediaRecorder 记录假上游收到的请求，供断言头族/请求体形态。
+type mediaRecorder struct {
+	imageBody string
+	imageAuth string
+	tcAuth    string
+	submitRaw string
+	queryRaw  string
+}
+
+// mediaFakeUpstream 按路径 + X-TC-Action 路由的假上游：
+//   - /v2/images/generations → 生图信封（code=0 + data.data[].url）
+//   - /agenttool/v1/tcproxy  → 视频提交/查询（TC3 签名头 + Response 包裹）
+func mediaFakeUpstream(t *testing.T, rec *mediaRecorder) *upstream.Client {
+	t.Helper()
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			var status int
+			var body string
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/v2/images/generations"):
+				rec.imageBody = string(raw)
+				rec.imageAuth = r.Header.Get("Authorization")
+				status = 200
+				body = `{"code":0,"msg":"","data":{"created":1,"data":[{"url":"https://cos.example/a.png","revised_prompt":"a cat"}],"usage":{"total_tokens":12,"credit":5.71}}}`
+			case strings.HasSuffix(r.URL.Path, "/agenttool/v1/tcproxy"):
+				rec.tcAuth = r.Header.Get("Authorization")
+				switch r.Header.Get("X-TC-Action") {
+				case "SubmitAigcVideoJob":
+					rec.submitRaw = string(raw)
+					status = 200
+					body = `{"Response":{"JobId":"job-123","RequestId":"req-1"}}`
+				case "DescribeAigcVideoJob":
+					rec.queryRaw = string(raw)
+					status = 200
+					body = `{"Response":{"Status":"DONE","ResultUrl":"https://cos.example/v.mp4","RequestId":"req-2"}}`
+				default:
+					status, body = 400, `{"Response":{"Error":{"Code":"InvalidAction"}}}`
+				}
+			default:
+				status, body = 404, `no route`
+			}
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+}
+
+func mediaHandler(t *testing.T, rec *mediaRecorder) *Handler {
+	t.Helper()
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	return NewHandler(Config{Pool: p, Upstream: mediaFakeUpstream(t, rec), APIKey: "sk-test"})
+}
+
+func authedReq(method, path, body string) *http.Request {
+	var r *http.Request
+	if body == "" {
+		r = httptest.NewRequest(method, path, nil)
+	} else {
+		r = httptest.NewRequest(method, path, strings.NewReader(body))
+	}
+	r.Header.Set("Authorization", "Bearer sk-test")
+	return r
+}
+
+// TestImagesGenerations 生图同步链路：编码前缀剥离 + 上游 url 透出 + usage 透出。
+func TestImagesGenerations(t *testing.T) {
+	rec := &mediaRecorder{}
+	h := mediaHandler(t, rec)
+
+	req := authedReq("POST", "/v1/images/generations", `{"model":"cn:hunyuan-image-alpha","prompt":"a cat"}`)
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Data []struct {
+			URL           string `json:"url"`
+			RevisedPrompt string `json:"revised_prompt"`
+		} `json:"data"`
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v body=%s", err, rr.Body.String())
+	}
+	if len(resp.Data) != 1 || resp.Data[0].URL != "https://cos.example/a.png" {
+		t.Fatalf("data=%+v", resp.Data)
+	}
+	if resp.Data[0].RevisedPrompt != "a cat" {
+		t.Errorf("revised_prompt=%q", resp.Data[0].RevisedPrompt)
+	}
+	if resp.Usage == nil {
+		t.Error("usage missing")
+	}
+	// 前缀剥离：上游应收到裸模型名，而不是 "cn:hunyuan-image-alpha"。
+	if !strings.Contains(rec.imageBody, `"model":"hunyuan-image-alpha"`) {
+		t.Errorf("upstream body=%s", rec.imageBody)
+	}
+	if rec.imageAuth != "Bearer at1" {
+		t.Errorf("upstream auth=%q", rec.imageAuth)
+	}
+}
+
+func TestImagesGenerationsValidation(t *testing.T) {
+	rec := &mediaRecorder{}
+	h := mediaHandler(t, rec)
+
+	// 缺 prompt → 400
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, authedReq("POST", "/v1/images/generations", `{"prompt":"  "}`))
+	if rr.Code != 400 {
+		t.Fatalf("blank prompt code=%d want 400", rr.Code)
+	}
+
+	// 无鉴权 → 401
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, httptest.NewRequest("POST", "/v1/images/generations", strings.NewReader(`{"prompt":"x"}`)))
+	if rr2.Code != 401 {
+		t.Fatalf("no auth code=%d want 401", rr2.Code)
+	}
+}
+
+// TestVideosGenerationsFlow 生视频异步链路：提交取 JobId、轮询取产物、未知任务 404。
+func TestVideosGenerationsFlow(t *testing.T) {
+	rec := &mediaRecorder{}
+	h := mediaHandler(t, rec)
+
+	// 提交
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, authedReq("POST", "/v1/videos/generations", `{"model":"cn:kling-v2.6","prompt":"a dog"}`))
+	if rr.Code != 200 {
+		t.Fatalf("submit code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var sub struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	json.Unmarshal(rr.Body.Bytes(), &sub)
+	if sub.ID != "job-123" || sub.Status != "submitted" {
+		t.Fatalf("submit resp=%+v", sub)
+	}
+	// 目录 ID 拆成 vendor/model 落到上游
+	if !strings.Contains(rec.submitRaw, `"Vendor":"Kling"`) || !strings.Contains(rec.submitRaw, `"Model":"v2.6"`) {
+		t.Errorf("submit body=%s", rec.submitRaw)
+	}
+	// TC3 授权头：secret_id = "<provider>.<accessToken>"
+	if !strings.HasPrefix(rec.tcAuth, "TC3-HMAC-SHA256 Credential=video-effect.at1/") {
+		t.Errorf("tc auth=%q", rec.tcAuth)
+	}
+
+	// 查询（同一账号）
+	rr2 := httptest.NewRecorder()
+	h.ServeHTTP(rr2, authedReq("GET", "/v1/videos/generations/job-123", ""))
+	if rr2.Code != 200 {
+		t.Fatalf("query code=%d body=%s", rr2.Code, rr2.Body.String())
+	}
+	var q struct {
+		Status string `json:"status"`
+		URL    string `json:"url"`
+	}
+	json.Unmarshal(rr2.Body.Bytes(), &q)
+	if q.Status != "succeeded" || q.URL != "https://cos.example/v.mp4" {
+		t.Fatalf("query resp=%+v", q)
+	}
+
+	// 未知任务 → 404（进程内任务表未命中）
+	rr3 := httptest.NewRecorder()
+	h.ServeHTTP(rr3, authedReq("GET", "/v1/videos/generations/nope", ""))
+	if rr3.Code != 404 {
+		t.Fatalf("unknown job code=%d want 404", rr3.Code)
+	}
+}
+
+func TestParseVideoModel(t *testing.T) {
+	cases := []struct{ in, vendor, model string }{
+		{"kling-v2.6", "Kling", "v2.6"},
+		{"Kling-2.0", "Kling", "2.0"},
+		{"kling", "Kling", ""},
+		{"v2.6", "", "v2.6"},
+		{"", "", ""},
+		{"  kling-v2.6  ", "Kling", "v2.6"},
+	}
+	for _, c := range cases {
+		v, m := parseVideoModel(c.in)
+		if v != c.vendor || m != c.model {
+			t.Errorf("parseVideoModel(%q)=(%q,%q) want (%q,%q)", c.in, v, m, c.vendor, c.model)
+		}
+	}
+}
+
+// TestMediaModelEntriesInCatalog 媒体模型登记进 /v1/models 目录（带 type 标记）。
+func TestMediaModelEntriesInCatalog(t *testing.T) {
+	entries := mediaModelEntries()
+	if len(entries) != 2 {
+		t.Fatalf("want 2 media entries, got %d", len(entries))
+	}
+	want := map[string]string{
+		"cn:" + upstream.DefaultImageModel: "image",
+		"cn:kling-" + upstream.DefaultVideoModel: "video",
+	}
+	for _, e := range entries {
+		id, _ := e["id"].(string)
+		typ, _ := e["type"].(string)
+		if want[id] != typ {
+			t.Errorf("entry id=%q type=%q not in catalog expectation", id, typ)
+		}
+		delete(want, id)
+	}
+	if len(want) != 0 {
+		t.Errorf("missing media entries: %v", want)
+	}
+}

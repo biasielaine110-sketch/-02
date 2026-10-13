@@ -296,6 +296,19 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, entry)
 	}
+	// 多模态（生图/生视频）：网关本地静态登记，不在上游 chat 目录里；
+	// 此处补进面板列表，与 /v1/models 同源（upstream.MediaModelCatalog），
+	// 避免两侧各写一份而漂移。media=true 供前端做区分标注。
+	for _, m := range upstream.MediaModelCatalog() {
+		out = append(out, map[string]any{
+			"id":          m.ID,
+			"name":        m.ID,
+			"type":        m.Type,
+			"capability":  m.Capability,
+			"description": m.Description,
+			"media":       true,
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 

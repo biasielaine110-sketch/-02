@@ -897,6 +897,25 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 }
 
+// filterNonMedia 剥离多模态（生图/生视频）静态目录条目，只留 chat 模型。
+// 媒体条目带 "type" 字段（image / video），chat 模型目录不带，据此区分；
+// 供只关心 chat 目录的测试复用（媒体条目的存在性由专门断言覆盖）。
+func filterNonMedia(t *testing.T, data []any) []any {
+	t.Helper()
+	out := make([]any, 0, len(data))
+	for _, m := range data {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			t.Fatalf("model entry not a map: %v", m)
+		}
+		if _, isMedia := mm["type"]; isMedia {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
 func TestModelsDynamic(t *testing.T) {
 	// 清缓存
 	dynamicModelsCache.Lock()
@@ -919,8 +938,11 @@ func TestModelsDynamic(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	data := resp["data"].([]any)
-	if len(data) != 3 {
-		t.Fatalf("want 3 dynamic models, got %d: %v", len(data), data)
+	// 媒体模型（生图/生视频）为网关本地静态登记，不属于动态 chat 目录；
+	// 先剥离，再断言动态 chat 模型的条数（本测试只关心 chat 目录）。
+	chat := filterNonMedia(t, data)
+	if len(chat) != 3 {
+		t.Fatalf("want 3 dynamic models, got %d: %v", len(chat), chat)
 	}
 	ids := map[string]bool{}
 	for _, m := range data {
@@ -998,8 +1020,12 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	var resp map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &resp)
 	data := resp["data"].([]any)
-	if len(data) != 0 {
-		t.Errorf("pure-dynamic failure should yield empty list, got %d", len(data))
+	if chat := filterNonMedia(t, data); len(chat) != 0 {
+		t.Errorf("pure-dynamic failure should yield empty chat list, got %d", len(chat))
+	}
+	// 多模态目录与上游 chat 探测无关（网关本地静态登记），即使 chat 探测失败仍应在册。
+	if len(data) != len(mediaModelEntries()) {
+		t.Errorf("media models should still be listed on chat probe failure, got %d", len(data))
 	}
 }
 
