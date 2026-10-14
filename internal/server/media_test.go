@@ -40,7 +40,10 @@ func mediaFakeUpstream(t *testing.T, rec *mediaRecorder) *upstream.Client {
 	t.Helper()
 	return &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			var raw []byte
+			if r.Body != nil { // 无 body 的请求（如内部拉模型）Body 为 nil，不可直接 ReadAll
+				raw, _ = io.ReadAll(r.Body)
+			}
 			var status int
 			var body string
 			switch {

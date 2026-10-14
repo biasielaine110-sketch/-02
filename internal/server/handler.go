@@ -173,6 +173,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if applyCORS(w, r) {
 		return
 	}
+	// 媒体请求单独留一行访问日志（此前完全不落日志，前端报错时无法判断请求是否到过网关）。
+	if isMediaPath(r.URL.Path) {
+		lw, done := logMediaAccess(w, r)
+		defer done()
+		h.mux.ServeHTTP(lw, r)
+		return
+	}
 	h.mux.ServeHTTP(w, r)
 }
 
