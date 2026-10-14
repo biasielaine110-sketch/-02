@@ -94,8 +94,7 @@ func TestImagesGenerationsMioraEdit(t *testing.T) {
 func TestImagesGenerationsMioraValidation(t *testing.T) {
 	cases := []string{
 		`{"model":"cn:miora-image","prompt":"x","n":2}`,                             // 上游一次只出一张
-		`{"model":"hunyuan-image-alpha","prompt":"x","images":["https://x/a.png"]}`, // 旧通道不认 images
-		`{"model":"hunyuan-image-alpha","prompt":"x","quality":"hd"}`,               // 旧通道不认 quality
+		`{"model":"hunyuan-image-alpha","prompt":"x","images":["https://x/a.png"]}`, // 旧通道不认 images，静默忽略会误导改图意图
 	}
 	for _, body := range cases {
 		rec := &mediaRecorder{}
@@ -108,6 +107,28 @@ func TestImagesGenerationsMioraValidation(t *testing.T) {
 		if rec.mioraImageSubmit != "" || rec.mioraImageEditSubmit != "" {
 			t.Errorf("body=%s must be rejected locally, upstream saw a call", body)
 		}
+	}
+}
+
+// TestImagesGenerationsNonMioraIgnoresQuality 旧通道不认 quality：静默丢弃、不本地拦截。
+// quality 只是软提示，画布等前端在选了非 Auto 质量时会无条件带上该字段——
+// 若据此 400 会误伤纯文生图。
+func TestImagesGenerationsNonMioraIgnoresQuality(t *testing.T) {
+	rec := &mediaRecorder{}
+	h := mediaHandler(t, rec)
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, authedReq("POST", "/v1/images/generations",
+		`{"model":"hunyuan-image-alpha","prompt":"x","quality":"hd"}`))
+	if rr.Code != 200 {
+		t.Fatalf("code=%d body=%s", rr.Code, rr.Body.String())
+	}
+	// 请求必须真的走到旧通道，且 quality 不被透传（旧通道会拒绝该字段）。
+	if rec.imageBody == "" {
+		t.Fatal("upstream saw no /v2/images/generations call")
+	}
+	if strings.Contains(rec.imageBody, "quality") {
+		t.Errorf("quality must be dropped before upstream: %s", rec.imageBody)
 	}
 }
 

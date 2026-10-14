@@ -66,11 +66,6 @@ type imageRequest struct {
 	Images         *[]upstream.MediaPayload  `json:"images"`
 }
 
-// hasExtraImageFields 报告请求是否携带仅 miora 图片通道认识的字段。
-func (req imageRequest) hasExtraImageFields() bool {
-	return req.Images != nil || strings.TrimSpace(req.Quality) != ""
-}
-
 func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	body, ok := h.readMediaBody(w, r, "image", mediaMaxBodyBytes)
 	if !ok {
@@ -98,12 +93,14 @@ func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		h.imagesGenerationsMiora(w, r, realm, req)
 		return
 	}
-	// images/quality 是 miora 专属字段；旧通道会静默忽略，调用方会误以为改图生效，故本地拒绝。
-	if req.hasExtraImageFields() {
+	// images 是改图意图（miora 专属）；旧通道会静默忽略、调用方会误以为改图生效，故本地拒绝。
+	if req.Images != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-			"images/quality are only supported by cn:miora-image* models")
+			"images (image editing) is only supported by cn:miora-image* models")
 		return
 	}
+	// quality 只是软提示，旧通道不支持——静默忽略即可（OpenAI 兼容客户端/画布在选了非 Auto
+	// 质量时会无条件带上该字段，据此 400 会误伤纯文生图）。此处刻意不拦截。
 
 	imgs, uerr := h.runMedia(w, r, realm, func(ctx context.Context, a *auth.Auth) (any, error) {
 		out, u, err := h.cfg.Upstream.GenerateImage(ctx, a, req.Prompt, bare, req.Size, req.N)
