@@ -66,6 +66,14 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// Files 上传文件存储（/v1/files/upload 参考图链路用，见 files.go）。
+	// nil 时 NewHandler 自建（测试与裸用场景无需关心）。
+	Files *fileStore
+
+	// PublicBaseURL 本网关对外基址（如 https://wb2api.tailb5bc86.ts.net），用于拼
+	// 上传文件的回链。空 = 从 X-Forwarded-Proto/Host 或 r.Host 推断。
+	PublicBaseURL string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -113,6 +121,15 @@ type Handler struct {
 	// 面板在线改 server.max_body_mb 时经 SetMaxBodyBytes 热生效，无需重启
 	// （issue #17：改了配置却静默不生效，用户仍被 8MB 413 拦截）。
 	maxBodyBytes atomic.Int64
+
+	// publicBase 公网基址的运行期值（cfg.PublicBaseURL 的原子镜像，见 files.go）。
+	// 面板在线改 server.public_base_url 时经 SetPublicBaseURL 热生效。
+	publicBase atomic.Value // string
+}
+
+// SetPublicBaseURL 热更新公网基址（面板保存配置路径调用）。空串 = 回到「按请求头推断」。
+func (h *Handler) SetPublicBaseURL(s string) {
+	h.publicBase.Store(strings.TrimRight(strings.TrimSpace(s), "/"))
 }
 
 // SetMaxBodyBytes 热更新请求体上限（面板保存配置路径调用）。
@@ -141,7 +158,11 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
+	if cfg.Files == nil {
+		cfg.Files = newFileStore() // 参考图上传存储（files.go）
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.SetPublicBaseURL(cfg.PublicBaseURL)
 	h.maxBodyBytes.Store(cfg.MaxBodyBytes)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
@@ -159,6 +180,13 @@ func NewHandler(cfg Config) *Handler {
 	// OpenAI Images Edits 兼容层（见 image_compat.go）：给图 + 指令改图，固定走 miora
 	// 通道（旧生图通道只有文生图）。供按 OpenAI 图片协议调用的前端（如「Nww-无限画布」）使用。
 	h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(h.imagesEditsCompat))
+	// 参考图上传（见 files.go）：「Nww-无限画布」的视频链路在提交前必须先把参考图
+	// POST 到 /v1/files/upload 拿一个 https 链接，否则直接报「视频生成超时」且不留任何
+	// 网关日志。GET /v1/files/{id} 取图**不鉴权**（上游抓取器带不了 Bearer），
+	// 等价于一条不可枚举的签名链接。
+	h.mux.HandleFunc("POST /v1/files/upload", h.withAuth(h.filesUpload))
+	h.mux.HandleFunc("POST /v1/uploads/images", h.withAuth(h.filesUpload))
+	h.mux.HandleFunc("GET /v1/files/{id}", h.filesGet)
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {

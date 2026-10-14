@@ -59,6 +59,9 @@ func (h *Handler) videosCompatCreate(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 参考图若是「本网关 /v1/files/{id}」的回链（画布上传后原样回填），直接物化成
+	// base64 送上游——省掉上游回源抓我们域名的一跳，也免了 Funnel 抖动导致的假失败。
+	h.materializeVideoRefs(&req)
 
 	jobID, ok := h.submitVideoJob(w, r, req)
 	if !ok {
@@ -126,17 +129,25 @@ func compatVideoStatus(job *upstream.VideoJob) (string, int) {
 
 // compatVideoJSON OpenAI 视频提交的 JSON 形态。该前端还会多发 seconds/duration、
 // ratio/aspect_ratio/size、resolution/resolution_name 等同义别名，这里统一收敛到 videoRequest。
+//
+// 参考图有两套字段名都会出现：
+//   - input_reference：OpenAI 视频协议（`{image_url:…}` 或字符串/数组）；
+//   - first_frame_image / last_frame_image：miora 原生叫法，画布的**第三套兜底请求体**
+//     直接用它。少认这一对就会把「图生视频」静默降级成文生视频（画布首尾两套失败后
+//     回落到这里，图被丢掉却仍然 200 出片——最难查的那种错）。
 type compatVideoJSON struct {
-	Model          string          `json:"model"`
-	Prompt         string          `json:"prompt"`
-	Duration       looseSeconds    `json:"duration"`
-	Seconds        looseSeconds    `json:"seconds"`
-	AspectRatio    string          `json:"aspect_ratio"`
-	Ratio          string          `json:"ratio"`
-	Size           string          `json:"size"`
-	Resolution     string          `json:"resolution"`
-	ResolutionName string          `json:"resolution_name"`
-	InputReference json.RawMessage `json:"input_reference"`
+	Model           string          `json:"model"`
+	Prompt          string          `json:"prompt"`
+	Duration        looseSeconds    `json:"duration"`
+	Seconds         looseSeconds    `json:"seconds"`
+	AspectRatio     string          `json:"aspect_ratio"`
+	Ratio           string          `json:"ratio"`
+	Size            string          `json:"size"`
+	Resolution      string          `json:"resolution"`
+	ResolutionName  string          `json:"resolution_name"`
+	InputReference  json.RawMessage `json:"input_reference"`
+	FirstFrameImage json.RawMessage `json:"first_frame_image"`
+	LastFrameImage  json.RawMessage `json:"last_frame_image"`
 }
 
 // looseSeconds 接受数字或字符串（前端两种都会发）形式的秒数；非数值按「未提供」处理。
@@ -175,10 +186,34 @@ func parseVideoCompatJSON(body []byte) (videoRequest, error) {
 		return videoRequest{}, err
 	}
 	applyReferenceImages(&req, imgs)
+	// first_frame_image / last_frame_image：miora 原生字段名。已由 input_reference
+	// 给出首帧时不覆盖（前者更贴近 OpenAI 协议，优先级更高）。
+	if req.FirstFrame == nil {
+		p, err := parseOneMediaRef(c.FirstFrameImage)
+		if err != nil {
+			return videoRequest{}, fmt.Errorf("first_frame_image: %w", err)
+		}
+		req.FirstFrame = p
+	}
+	if req.LastFrame == nil {
+		p, err := parseOneMediaRef(c.LastFrameImage)
+		if err != nil {
+			return videoRequest{}, fmt.Errorf("last_frame_image: %w", err)
+		}
+		req.LastFrame = p
+	}
 	return req, nil
 }
 
-// parseVideoCompatMultipart 解析 multipart/form-data 形态的提交（带 input_reference 文件）。
+// multipart 里的图片字段名。参考图用前三者，首/尾帧用后两者（画布的不同兜底形态
+// 会用不同叫法；少认一个就静默丢图）。
+var (
+	multipartRefFields   = []string{"input_reference", "images", "image", "references"}
+	multipartFirstFields = []string{"first_frame_image", "first_frame"}
+	multipartLastFields  = []string{"last_frame_image", "last_frame"}
+)
+
+// parseVideoCompatMultipart 解析 multipart/form-data 形态的提交（带参考图文件/字段）。
 func parseVideoCompatMultipart(w http.ResponseWriter, r *http.Request) (videoRequest, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, videoMaxBodyBytes)
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
@@ -193,41 +228,85 @@ func parseVideoCompatMultipart(w http.ResponseWriter, r *http.Request) (videoReq
 		AspectRatio: normalizeAspectRatio(firstNonEmpty(get("aspect_ratio"), get("ratio"), ratioLike(get("size")))),
 		Resolution:  normalizeVideoResolution(firstNonEmpty(get("resolution"), get("resolution_name"))),
 	}
-	imgs, err := readMultipartReferenceImages(r)
+
+	// 首/尾帧：先找文件字段，再退到表单值（URL 或 base64 都可能直接作为字段值发来）。
+	p, err := firstMultipartMedia(r, multipartFirstFields)
 	if err != nil {
-		return videoRequest{}, err
+		return videoRequest{}, fmt.Errorf("first_frame_image: %w", err)
 	}
-	applyReferenceImages(&req, imgs)
+	req.FirstFrame = p
+	p, err = firstMultipartMedia(r, multipartLastFields)
+	if err != nil {
+		return videoRequest{}, fmt.Errorf("last_frame_image: %w", err)
+	}
+	req.LastFrame = p
+
+	// 没显式给首/尾帧时，才把 input_reference/images 当参考图（1 张→首帧，多张→多参考）。
+	if req.FirstFrame == nil && req.LastFrame == nil {
+		imgs, err := readMultipartMedia(r, multipartRefFields)
+		if err != nil {
+			return videoRequest{}, err
+		}
+		applyReferenceImages(&req, imgs)
+	}
 	return req, nil
 }
 
-// readMultipartReferenceImages 把 multipart 里的 input_reference 文件读成 base64 载荷。
-// 该前端在「有参考图」时走 multipart，把图片原始字节作为 input_reference 直接上传。
-func readMultipartReferenceImages(r *http.Request) ([]upstream.MediaPayload, error) {
+// firstMultipartMedia 按字段名依次找一张图：先文件字段，再表单值。都没有返回 nil。
+func firstMultipartMedia(r *http.Request, names []string) (*upstream.MediaPayload, error) {
+	imgs, err := readMultipartMedia(r, names)
+	if err != nil {
+		return nil, err
+	}
+	if len(imgs) > 0 {
+		return &imgs[0], nil
+	}
+	for _, n := range names {
+		if p := mediaFromFormValue(r.FormValue(n)); p != nil {
+			return p, nil
+		}
+	}
+	return nil, nil
+}
+
+// readMultipartMedia 把指定字段名下的文件读成 base64 载荷（按 names 顺序、组内按出现顺序）。
+// 该前端在「有参考图」时走 multipart，把图片原始字节作为字段文件上传。
+func readMultipartMedia(r *http.Request, names []string) ([]upstream.MediaPayload, error) {
 	if r.MultipartForm == nil {
 		return nil, nil
 	}
-	files := r.MultipartForm.File["input_reference"]
-	if len(files) == 0 {
-		return nil, nil
-	}
-	out := make([]upstream.MediaPayload, 0, len(files))
-	for _, fh := range files {
-		f, err := fh.Open()
-		if err != nil {
-			return nil, fmt.Errorf("open input_reference: %w", err)
+	var out []upstream.MediaPayload
+	for _, name := range names {
+		for _, fh := range r.MultipartForm.File[name] {
+			f, err := fh.Open()
+			if err != nil {
+				return nil, fmt.Errorf("open %s: %w", name, err)
+			}
+			raw, err := io.ReadAll(io.LimitReader(f, 32<<20))
+			_ = f.Close()
+			if err != nil {
+				return nil, fmt.Errorf("read %s: %w", name, err)
+			}
+			if len(raw) == 0 {
+				continue
+			}
+			out = append(out, upstream.MediaPayload{Base64: base64.StdEncoding.EncodeToString(raw)})
 		}
-		raw, err := io.ReadAll(io.LimitReader(f, 32<<20))
-		_ = f.Close()
-		if err != nil {
-			return nil, fmt.Errorf("read input_reference: %w", err)
-		}
-		if len(raw) == 0 {
-			continue
-		}
-		out = append(out, upstream.MediaPayload{Base64: base64.StdEncoding.EncodeToString(raw)})
 	}
 	return out, nil
+}
+
+// mediaFromFormValue 把 multipart 表单值当图片载荷：http(s) 视为 URL，其余交给
+// MediaPayload 的字符串简写（data URI / 裸 base64）。空值返回 nil。
+func mediaFromFormValue(s string) *upstream.MediaPayload {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
+		return &upstream.MediaPayload{URL: s}
+	}
+	return &upstream.MediaPayload{Base64: s}
 }
 
 // parseInputReference 解析 OpenAI 的 input_reference 字段，兼容：

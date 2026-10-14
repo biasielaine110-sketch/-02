@@ -307,6 +307,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。**面板在线修改即时生效** |
+| `server.public_base_url` | `""`（自动推断） | 本网关对外基址，用于 `/v1/files/upload` 回链。留空则按 `X-Forwarded-Proto`/`Host` → `Host` 推断；反向代理改写 Host 时必须显式配死（如 `https://wb2api.tailb5bc86.ts.net`） |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
@@ -546,6 +547,19 @@ http://127.0.0.1:7863/panel/
 | `POST /v1/images/edits` | Bearer | 改图（`cn:miora-image-edit`，`images[]` 传原图） |
 | `POST /v1/videos/generations` | Bearer | 生视频**提交**（`cn:miora-minimax-h3` 文生 / `cn:kling-v2.6`），返回任务号 |
 | `GET /v1/videos/generations/{id}` | Bearer | 生视频**轮询**：`status` 为 `in_progress` / `succeeded` / `failed`，成功后带签名 `url` |
+| `POST /v1/videos` | Bearer | OpenAI 视频协议**提交**（「Nww-无限画布」等按 OpenAI 视频协议调用的前端）；入参 JSON 或 multipart，返回 `{id, object:"video", status:"queued"}` |
+| `GET /v1/videos/{id}` | Bearer | OpenAI 视频协议**轮询**；三态 `in_progress` / `completed` / `failed`，完成时在 `video_url` / `url` 给 mp4 直链 |
+| `POST /v1/files/upload` | Bearer | **参考图上传**：multipart，字段名 `file`（兼容 `image` / `images` / `input_reference` / `first_frame_image` / `files[]`），返回 `{id, url, data:{id, url}}`；`url` 是可直接回填的公网直链 |
+| `POST /v1/uploads/images` | Bearer | 参考图上传别名（供参考图预处理流程使用） |
+| `GET /v1/files/{id}` | **无鉴权** | 取回已上传图片字节（供上游抓取器 / 前端回显）；id 为 128bit 随机串，等同不可枚举的签名链接 |
+
+#### 参考图上传（画布图生视频链路）
+
+按 OpenAI 视频协议调用的前端（如「Nww-无限画布」）在提交视频前，**必须先把参考图 `POST /v1/files/upload`（multipart，字段名 `file`）换成 https 直链**（前端硬校验回链匹配 `^https?://`，data URI 不算），再把该链接作为 `input_reference: {image_url: …}` 回填 `POST /v1/videos`。
+
+- 网关对**指向自家 `/v1/files/{id}` 的回链**会在提交上游前**物化成 base64**，省掉上游回源抓我们域名的一跳，也避免 Funnel 抖动带来的假失败。
+- 回链基址由 `server.public_base_url` 指定；不设则依次按 `X-Forwarded-Proto`/`Host` 头 → `Host` 推断。**反向代理会改写 Host 时务必显式配死**，否则回链可能落到内网地址。
+- 参考图存在进程内（TTL 2h、上限 512 条），重启即失效——短生命周期数据，不做持久化。
 
 生视频三种图片输入模式由请求体字段分流（互斥，优先级：首尾帧 > 参考）：
 
@@ -554,6 +568,8 @@ http://127.0.0.1:7863/panel/
 | 均不传 | 文生视频 |
 | `first_frame`（+ 可选 `last_frame`） | 首帧 / 首尾帧 |
 | `references: [...]` | 参考生（可多张） |
+| `input_reference: {image_url}` / `input_reference: [ … ]` | OpenAI 视频协议：单张 → 首帧，多张 → 参考生 |
+| `first_frame_image` / `last_frame_image` | miora 原生字段别名（等价 `first_frame` / `last_frame`） |
 
 #### 媒体并发模型（一任务一账号）
 

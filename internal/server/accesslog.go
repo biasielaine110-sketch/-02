@@ -17,9 +17,14 @@ import (
 //   - 有 `[media]` 行 → 请求到过网关，行内的状态码就是网关的真实答复；
 //   - 无 `[media]` 行 → 请求根本没到网关，问题在链路（Cloudflare 代理 / Funnel / 前端）。
 //
-// 只覆盖 /v1/images/* 与 /v1/videos*，chat 走既有统计表，不重复记录。
+// 覆盖 /v1/images/*、/v1/videos*、/v1/files*、/v1/uploads*，chat 走既有统计表，不重复记录。
+//
+// /v1/files 与 /v1/uploads 必须一起覆盖：画布的视频链路**在提交生成之前**先打
+// `/v1/files/upload`，这一步 404 时如果没日志，现场只剩浏览器控制台一行 404，
+// 会让人误以为是链路问题（见 files.go 顶部注释）。
 func isMediaPath(p string) bool {
-	return strings.HasPrefix(p, "/v1/images") || strings.HasPrefix(p, "/v1/videos")
+	return strings.HasPrefix(p, "/v1/images") || strings.HasPrefix(p, "/v1/videos") ||
+		strings.HasPrefix(p, "/v1/files") || strings.HasPrefix(p, "/v1/uploads")
 }
 
 // statusRecorder 记录已写出的状态码（未显式 WriteHeader 时按 net/http 语义视为 200）。

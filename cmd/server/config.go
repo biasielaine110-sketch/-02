@@ -28,6 +28,12 @@ type Config struct {
 		// （issue #41：截断的 JSON 让上游 unmarshal 报 unexpected EOF，网关却罚号）。
 		// 0/负数视为非法 → normalize 回落默认并记录。
 		MaxBodyMB int `json:"max_body_mb"`
+
+		// PublicBaseURL 本网关对外基址（如 https://wb2api.tailb5bc86.ts.net），
+		// 用于拼「参考图上传」后回给画布的文件链接（/v1/files/{id}）。
+		// 空 = 从请求头 X-Forwarded-Proto/Host 或 Host 推断（Funnel/Cloudflare 都会带）。
+		// 反向代理改写了 Host 时建议显式配死，避免回链指向内网地址。
+		PublicBaseURL string `json:"public_base_url"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -320,6 +326,9 @@ func applyEnv(c *Config) {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.Server.MaxBodyMB = n
 		}
+	}
+	if v := os.Getenv("WB2A_PUBLIC_BASE_URL"); v != "" {
+		c.Server.PublicBaseURL = v
 	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v

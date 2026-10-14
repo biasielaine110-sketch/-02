@@ -275,6 +275,7 @@ func main() {
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		PublicBaseURL: cfg.Server.PublicBaseURL,          // 参考图上传回链基址（见 files.go）
 	})
 	chatHandler = h
 
@@ -393,6 +394,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
 	if srv != nil {
 		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
+		srv.SetPublicBaseURL(newCfg.Server.PublicBaseURL)
 	}
 
 	return restartRequiredFields(newCfg), nil

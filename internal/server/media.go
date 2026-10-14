@@ -83,6 +83,10 @@ func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	// 前端发的是比例（1:1 / 16:9 …）或 auto，上游只认「数字x数字」——先归一。
 	req.Size = normalizeImageSize(req.Size)
+	// 改图参考图若指向本网关已上传文件（/v1/files/{id}），物化成 base64 再送上游。
+	if req.Images != nil {
+		h.materializeImageRefs(req.Images)
+	}
 	realm, bare := resolveModel(req.Model)
 	// 未指定模型时按 realm 回落默认生图模型。
 	if strings.TrimSpace(bare) == "" {
@@ -232,6 +236,8 @@ func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "parse request: "+err.Error())
 		return
 	}
+	// 参考图/首尾帧若指向本网关已上传文件（/v1/files/{id}），物化成 base64 再送上游。
+	h.materializeVideoRefs(&req)
 	jobID, ok := h.submitVideoJob(w, r, req)
 	if !ok {
 		return
