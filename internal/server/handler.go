@@ -168,6 +168,11 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// CORS 必须在 mux/鉴权之前：预检 OPTIONS 不带 Authorization，且 mux 对 OPTIONS 回 405
+	// （浏览器会因此判定 cross-origin block，真实请求发不出去）。详见 cors.go。
+	if applyCORS(w, r) {
+		return
+	}
 	h.mux.ServeHTTP(w, r)
 }
 
