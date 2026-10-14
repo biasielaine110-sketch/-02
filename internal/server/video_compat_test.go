@@ -153,14 +153,14 @@ func TestVideosCompatCreateMultipart(t *testing.T) {
 	h := mediaHandler(t, rec)
 
 	req := multipartVideoReq(t, map[string]string{
-		"model":         "cn:miora-minimax-h3",
-		"prompt":        "a robot",
-		"seconds":       "8",
-		"duration":      "8",
-		"ratio":         "9:16",
-		"aspect_ratio":  "9:16",
-		"resolution":    "1080p",
-		"watermark":     "false",
+		"model":          "cn:miora-minimax-h3",
+		"prompt":         "a robot",
+		"seconds":        "8",
+		"duration":       "8",
+		"ratio":          "9:16",
+		"aspect_ratio":   "9:16",
+		"resolution":     "1080p",
+		"watermark":      "false",
 		"generate_audio": "true",
 	}, "PNGDATA")
 	rr := httptest.NewRecorder()
@@ -313,8 +313,30 @@ func TestVideoCompatHelpers(t *testing.T) {
 			t.Errorf("normalizeAspectRatio(%q)=%q want %q", c.in, got, c.want)
 		}
 	}
-	if ratioLike("1280x720") != "" || ratioLike(" 16:9 ") != "16:9" {
-		t.Errorf("ratioLike misjudged pixel size vs ratio")
+	// ratioLike：冒号比例原样返回；像素尺寸就近映射到白名单画幅（画布按像素下发 size）。
+	sizeCases := []struct{ in, want string }{
+		{" 16:9 ", "16:9"}, {"21:9", "21:9"},
+		{"1280x720", "16:9"}, {"720x1280", "9:16"}, {"768x1344", "9:16"},
+		{"1344x768", "16:9"}, {"1024x1792", "9:16"}, {"1792x1024", "16:9"},
+		{"768x768", "1:1"}, {"1024x768", "4:3"}, {"1440x1920", "3:4"},
+		{"1536×672", "21:9"}, {"1440x2560", "9:16"},
+		{"", ""}, {"auto", ""}, {"768", ""},
+	}
+	for _, c := range sizeCases {
+		if got := ratioLike(c.in); got != c.want {
+			t.Errorf("ratioLike(%q)=%q want %q", c.in, got, c.want)
+		}
+	}
+	// resolutionLike：像素短边 <1000 → 768P，≥1000 → 2K；非像素尺寸返回空串。
+	resCases := []struct{ in, want string }{
+		{"768x1344", "768P"}, {"720x1280", "768P"}, {"1344x768", "768P"},
+		{"1440x2560", "2K"}, {"1024x1792", "2K"}, {"1792x1024", "2K"},
+		{"", ""}, {"16:9", ""}, {"720p", ""},
+	}
+	for _, c := range resCases {
+		if got := resolutionLike(c.in); got != c.want {
+			t.Errorf("resolutionLike(%q)=%q want %q", c.in, got, c.want)
+		}
 	}
 	var c compatVideoJSON
 	if err := json.Unmarshal([]byte(`{"seconds":"6","duration":7}`), &c); err != nil {

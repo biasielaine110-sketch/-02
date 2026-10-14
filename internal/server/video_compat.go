@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"regexp"
@@ -177,9 +178,9 @@ func parseVideoCompatJSON(body []byte) (videoRequest, error) {
 	req := videoRequest{
 		Model:       strings.TrimSpace(c.Model),
 		Prompt:      c.Prompt,
-		Duration: firstPositiveInt(int(c.Duration), int(c.Seconds)),
+		Duration:    firstPositiveInt(int(c.Duration), int(c.Seconds)),
 		AspectRatio: normalizeAspectRatio(firstNonEmpty(c.AspectRatio, c.Ratio, ratioLike(c.Size))),
-		Resolution:  normalizeVideoResolution(firstNonEmpty(c.Resolution, c.ResolutionName)),
+		Resolution:  normalizeVideoResolution(firstNonEmpty(c.Resolution, c.ResolutionName, resolutionLike(c.Size))),
 	}
 	imgs, err := parseInputReference(c.InputReference)
 	if err != nil {
@@ -224,9 +225,9 @@ func parseVideoCompatMultipart(w http.ResponseWriter, r *http.Request) (videoReq
 	req := videoRequest{
 		Model:       get("model"),
 		Prompt:      get("prompt"),
-		Duration: firstPositiveInt(parseLooseInt(get("duration")), parseLooseInt(get("seconds"))),
+		Duration:    firstPositiveInt(parseLooseInt(get("duration")), parseLooseInt(get("seconds"))),
 		AspectRatio: normalizeAspectRatio(firstNonEmpty(get("aspect_ratio"), get("ratio"), ratioLike(get("size")))),
-		Resolution:  normalizeVideoResolution(firstNonEmpty(get("resolution"), get("resolution_name"))),
+		Resolution:  normalizeVideoResolution(firstNonEmpty(get("resolution"), get("resolution_name"), resolutionLike(get("size")))),
 	}
 
 	// 首/尾帧：先找文件字段，再退到表单值（URL 或 base64 都可能直接作为字段值发来）。
@@ -393,6 +394,23 @@ var compatAspectAliases = map[string]string{
 
 var ratioPattern = regexp.MustCompile(`^\d{1,2}:\d{1,2}$`)
 
+// pixelSizePattern 匹配 "1280x720" / "768×1344" / "1024 * 1024" 这类像素尺寸。
+// 画布（infinite-atelier）按像素尺寸下发视频 size，故 size 必须能反推画幅与分辨率档。
+var pixelSizePattern = regexp.MustCompile(`^(\d{2,5})\s*[xX×*]\s*(\d{2,5})$`)
+
+// aspectCandidates 把像素尺寸就近映射到 miora 画幅白名单（与 compatAspectAliases 目标一致）。
+var aspectCandidates = []struct {
+	name string
+	val  float64
+}{
+	{"21:9", 21.0 / 9.0},
+	{"16:9", 16.0 / 9.0},
+	{"4:3", 4.0 / 3.0},
+	{"1:1", 1.0},
+	{"3:4", 3.0 / 4.0},
+	{"9:16", 9.0 / 16.0},
+}
+
 // normalizeAspectRatio 归一画幅：命中别名表则改写，其余原样透出（miora 侧仍会校验）。
 func normalizeAspectRatio(s string) string {
 	s = strings.TrimSpace(s)
@@ -420,13 +438,66 @@ func normalizeVideoResolution(s string) string {
 	}
 }
 
-// ratioLike 只在 s 形如 "16:9" 时返回它，避免把像素尺寸（"1280x720"）当画幅。
+// ratioLike 把请求里的 size 字段归一成画幅：
+//   - "16:9" 这类冒号比例 → 原样返回；
+//   - "768x1344" / "720x1280" 这类**像素尺寸** → 就近映射到白名单画幅。
+//
+// 画布按像素尺寸下发 size（如竖屏 768x1344），早先只认冒号写法会让画幅被静默丢弃、
+// 上游退化成默认横屏（实测 size-only → 1344×768）。这里仍**绝不**把像素串直接当画幅透传，
+// 一律收敛到 miora 白名单词表后再给上游。
 func ratioLike(s string) string {
 	s = strings.TrimSpace(s)
 	if ratioPattern.MatchString(s) {
 		return s
 	}
+	if w, h, ok := parsePixelSize(s); ok {
+		return nearestAspectRatio(float64(w) / float64(h))
+	}
 	return ""
+}
+
+// resolutionLike 从像素 size 反推 miora 分辨率档（768P / 2K）；非像素尺寸返回空串。
+// 短边 < 1000 → 768P，≥ 1000 → 2K（对应画布 SD/HD 两档：768x1344 vs 1440x2560）。
+// 仅作 resolution/resolution_name 缺省时的兜底，不覆盖客户端显式给的档位。
+func resolutionLike(s string) string {
+	w, h, ok := parsePixelSize(strings.TrimSpace(s))
+	if !ok {
+		return ""
+	}
+	short := w
+	if h < short {
+		short = h
+	}
+	if short >= 1000 {
+		return "2K"
+	}
+	return "768P"
+}
+
+// parsePixelSize 解析 "768x1344"（认 x / X / × / * / 空格分隔）为宽高。
+func parsePixelSize(s string) (int, int, bool) {
+	m := pixelSizePattern.FindStringSubmatch(s)
+	if m == nil {
+		return 0, 0, false
+	}
+	w, err1 := strconv.Atoi(m[1])
+	h, err2 := strconv.Atoi(m[2])
+	if err1 != nil || err2 != nil || w <= 0 || h <= 0 {
+		return 0, 0, false
+	}
+	return w, h, true
+}
+
+// nearestAspectRatio 在 aspectCandidates 里取与给定宽高比 log 距离最近者。
+func nearestAspectRatio(ar float64) string {
+	best := ""
+	bestDist := math.MaxFloat64
+	for _, c := range aspectCandidates {
+		if d := math.Abs(math.Log(ar / c.val)); d < bestDist {
+			bestDist, best = d, c.name
+		}
+	}
+	return best
 }
 
 // firstNonEmpty 返回首个非空（去空白后）字符串。
