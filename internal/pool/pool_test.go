@@ -1446,6 +1446,93 @@ func TestAcquireUnknownUID(t *testing.T) {
 	p.Release("nope") // 不 panic
 }
 
+// 媒体专用在途档（max_in_flight_media=1 即「一任务一账号」）。
+func TestAcquireMediaRespectsMediaLimit(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(3)      // chat 档
+	p.SetMaxInFlightMedia(1) // 媒体档
+
+	if !p.AcquireMedia("u1") {
+		t.Fatal("first media acquire should succeed")
+	}
+	if p.AcquireMedia("u1") {
+		t.Fatal("second media acquire must fail (media limit 1)")
+	}
+	// chat 档不受媒体档影响：媒体占 1 个后，chat 仍可再占 2 个（合计封顶 max_in_flight）。
+	if !p.Acquire("u1") || !p.Acquire("u1") {
+		t.Fatal("chat should still acquire up to max_in_flight")
+	}
+	if p.Acquire("u1") {
+		t.Fatal("total in-flight must cap at max_in_flight")
+	}
+	// 全部释放后媒体名额回到可用（Release 是媒体/chat 共用的同一枚计数）。
+	p.Release("u1")
+	p.Release("u1")
+	p.Release("u1")
+	if !p.AcquireMedia("u1") {
+		t.Fatal("media acquire after full release should succeed")
+	}
+}
+
+// 未设置媒体档（0）时回落 max_in_flight——零回归。
+func TestAcquireMediaFallsBackWhenUnset(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(2)
+	// 不调用 SetMaxInFlightMedia：媒体档=0 → 回落 2。
+	if !p.AcquireMedia("u1") || !p.AcquireMedia("u1") {
+		t.Fatal("media should inherit max_in_flight when media limit is unset")
+	}
+	if p.AcquireMedia("u1") {
+		t.Fatal("third media acquire should fail (inherited limit 2)")
+	}
+}
+
+// 媒体选号必须跳过「媒体在途已满」的账号（同一账号在 chat 口径下仍可选）。
+func TestPickExcludingForRealmMediaSkipsMediaFull(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "full"})
+	p.Add(&auth.Auth{UID: "idle"})
+	p.SetMaxInFlight(3)
+	p.SetMaxInFlightMedia(1)
+	if !p.AcquireMedia("full") {
+		t.Fatal("setup: media acquire on full should succeed")
+	}
+	for i := 0; i < 20; i++ {
+		got := p.PickExcludingForRealmMedia(nil, "", "")
+		if got == nil {
+			t.Fatal("expected a media-pickable account")
+		}
+		if got.UID == "full" {
+			t.Fatal("media pick must skip the account whose media slot is taken")
+		}
+	}
+	// 但 chat 口径不受媒体档限制：同一账号仅 1 个媒体在途 < max_in_flight=3，仍可占 chat 名额。
+	if !p.Acquire("full") || !p.Acquire("full") {
+		t.Fatal("chat口径 should ignore the media in-flight limit")
+	}
+}
+
+// 媒体档与 chat 档共用同一枚在途计数：媒体档更低时，需账号当前无在途请求才能启动。
+func TestMediaSharesInFlightCounterWithChat(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(3)
+	p.SetMaxInFlightMedia(1)
+	if !p.Acquire("u1") { // 一条 chat 在途
+		t.Fatal("chat acquire should succeed")
+	}
+	if p.AcquireMedia("u1") {
+		t.Fatal("media must wait for a fully idle account when media limit is 1")
+	}
+	p.Release("u1")
+	if !p.AcquireMedia("u1") {
+		t.Fatal("media should acquire once the account is idle")
+	}
+}
+
 func TestPickSkipsInFlightFull(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")

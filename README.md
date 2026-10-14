@@ -329,6 +329,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstash.url` / `upstash.token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.max_in_flight_global` | `2` | global 域单账号在途上限（国际版 WAF 风控更紧，压低并发） |
+| `pool.max_in_flight_media` | `0` | **媒体（生图/改图/生视频）专用**单账号在途上限：`0` = 回落到 `max_in_flight`；设 `1` = **一任务一账号**（每个媒体请求独占一个账号，池内 N 个账号即可 N 路并行） |
 | `pool.degrade_threshold` | `5` | 连败降权阈值：未知错误（ErrClient/传输层）连败 N 次临时出池 |
 | `pool.degrade_cooldown` / `pool.degrade_cooldown_max` | `10m` / `2h` | 连败降权时长与封顶 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
@@ -536,6 +537,37 @@ http://127.0.0.1:7863/panel/
 响应同时带 `X-Service: workbuddy2api` 头。这两个身份标识用于区分**本网关**与同端口上可能残留的其他服务——对方即使返回 2xx 也不会带该字段 / 头，宿主探测据此避免"假成功"。
 
 **宿主健康探测指引**：强校验（推荐）用 `/status` + `api_key`——只有持有正确 `api_key` 的本网关返回 200，其他服务返回 401 / 404；弱校验（不适合持 key 的负载均衡器）用 `/healthz` + `service` 字段判据（`/healthz` 恒无鉴权，`service == "workbuddy2api"` 才算命中本网关）。容器自带 `HEALTHCHECK` 用的就是弱校验（仅进程内自检，够用）。
+
+### 媒体端点（生图 / 改图 / 生视频）
+
+| 端点 | 鉴权 | 说明 |
+|---|---|---|
+| `POST /v1/images/generations` | Bearer | 文生图（`cn:miora-image` / `cn:hunyuan-image-alpha` 等） |
+| `POST /v1/images/edits` | Bearer | 改图（`cn:miora-image-edit`，`images[]` 传原图） |
+| `POST /v1/videos/generations` | Bearer | 生视频**提交**（`cn:miora-minimax-h3` 文生 / `cn:kling-v2.6`），返回任务号 |
+| `GET /v1/videos/generations/{id}` | Bearer | 生视频**轮询**：`status` 为 `in_progress` / `succeeded` / `failed`，成功后带签名 `url` |
+
+生视频三种图片输入模式由请求体字段分流（互斥，优先级：首尾帧 > 参考）：
+
+| 字段 | 模式 |
+|---|---|
+| 均不传 | 文生视频 |
+| `first_frame`（+ 可选 `last_frame`） | 首帧 / 首尾帧 |
+| `references: [...]` | 参考生（可多张） |
+
+#### 媒体并发模型（一任务一账号）
+
+- 媒体请求**没有全局串行锁**：多个 `/v1/images/*` 或 `/v1/videos/*` 请求可同时进入，各自独立选号。
+- 并发能力由 `pool.max_in_flight_media` 决定：
+  - `0`（默认）= 回落到 `pool.max_in_flight`，与聊天共用同一枚在途计数；
+  - `1` = **一任务一账号**——每个占用中的媒体任务独占一个账号，池内有多少健康账号就能同时跑多少条（`/healthz` 的 `healthy` 即当前并行上限）。
+- 选号时跳过在途已满的账号；媒体与聊天**共用同一计数**，因此账号正在聊天时不会被媒体任务抢走。
+- 排障：`grep -E '\[media-pick\]|\[media-lease\]'` 可看到每条媒体任务落在哪个账号、耗时多久。
+
+> 客户端示例：随附的 `生图生视频.py` 支持批量并行提交——
+> `python 生图生视频.py batch -f 提示词.txt --jobs 4`（生图）、
+> `python 生图生视频.py batch --kind video -f 视频.txt --jobs 3 --dur 5`（生视频）。
+> 每条任务各占一个账号，总墙钟 ≈ 最慢的单条而非各条之和。
 
 ### 流式行为细节
 

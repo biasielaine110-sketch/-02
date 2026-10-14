@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -57,13 +58,13 @@ const imageDownloadTimeout = 60 * time.Second
 //     MediaPayload 同形：字符串（http(s) URL / data URI / 裸 base64）或
 //     对象 {"base64":…|"url":…|"file_key":…}。用指针区分「未提供」与「空数组」。
 type imageRequest struct {
-	Model          string                    `json:"model"`
-	Prompt         string                    `json:"prompt"`
-	N              int                       `json:"n"`
-	Size           string                    `json:"size"`
-	Quality        string                    `json:"quality"`
-	ResponseFormat string                    `json:"response_format"` // "url"（默认）/ "b64_json"
-	Images         *[]upstream.MediaPayload  `json:"images"`
+	Model          string                   `json:"model"`
+	Prompt         string                   `json:"prompt"`
+	N              int                      `json:"n"`
+	Size           string                   `json:"size"`
+	Quality        string                   `json:"quality"`
+	ResponseFormat string                   `json:"response_format"` // "url"（默认）/ "b64_json"
+	Images         *[]upstream.MediaPayload `json:"images"`
 }
 
 func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +200,7 @@ type mediaImagePayload struct {
 // miora H3 扩展（仅 cn:miora-* 生效，见 videosGenerations 的通道校验）：
 //   - first_frame / last_frame：首尾帧图生视频（frame_to_video），首帧必填；
 //   - references              ：多参考图生视频（reference_to_video），数组须非空。
+//
 // 三者取值可为字符串（http(s) URL / data URI / 裸 base64）或对象
 // {"base64":…|"url":…|"file_key":…}，与上游 MediaPayload 同形（见 upstream.MediaPayload）。
 // References 用指针以区分「未提供（文生）」与「提供了空数组（应报错）」。
@@ -492,20 +494,33 @@ func (h *Handler) runMedia(w http.ResponseWriter, r *http.Request, realm string,
 
 // runMediaWithTimeout 同 runMedia，但可指定单次上游调用的超时。
 // miora 图片是「一次提交内完成出图」，需要比短视频调用宽松得多（见 mioraImageTimeout）。
+//
+// 并发模型（与 chat 共用账号池，但走**媒体专用在途档**）：
+//   - 选号用 PickExcludingForRealmMedia，在途判定用 pool 的 max_in_flight_media；
+//     该值显式设 1 时即「一任务一账号」——媒体任务只在账号无在途请求时才能占用，
+//     N 条并行任务会自动落到 N 个不同账号（选号还会跳过 tried，不会重试同一个号）。
+//   - 全程不做全局串行：并发容量 ≈ 健康账号数 × min(max_in_flight_media, max_in_flight)。
+//   - 每条任务打印 [media-pick] / [media-lease] 一行，供核对分流是否真的生效。
 func (h *Handler) runMediaWithTimeout(w http.ResponseWriter, r *http.Request, realm string,
 	timeout time.Duration, call func(ctx context.Context, a *auth.Auth) (any, error)) (any, error) {
 
 	tried := map[string]bool{}
 	var lastErr error
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickExcludingForRealm(tried, "", realm)
+		// 媒体专用选号：按 max_in_flight_media 判定在途（设 1 即「一任务一账号」）。
+		acct := h.cfg.Pool.PickExcludingForRealmMedia(tried, "", realm)
 		if acct == nil {
 			break
 		}
 		tried[acct.UID] = true
-		if !h.cfg.Pool.Acquire(acct.UID) {
+		if !h.cfg.Pool.AcquireMedia(acct.UID) {
+			// 该号媒体在途名额已满 → 换下一个号（不报错、不抢）。
 			continue
 		}
+		// 选中即记一行：媒体任务耗时以分钟计，这行用于确认「并发任务是否真的
+		// 分散到不同账号」（同 uid 的重叠区间 = 一号并发多条，属异常）。
+		log.Printf("[media-pick] uid=%s attempt=%d", acct.UID, i+1)
+		started := time.Now()
 
 		// token 临近过期先刷新（与 chat 同口径）。
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
@@ -513,6 +528,7 @@ func (h *Handler) runMediaWithTimeout(w http.ResponseWriter, r *http.Request, re
 				lastErr = err
 				h.cfg.Pool.NoteFailures(acct.UID)
 				h.cfg.Pool.Release(acct.UID)
+				log.Printf("[media-lease] uid=%s ok=false elapsed=%s err=refresh", acct.UID, time.Since(started).Round(time.Millisecond))
 				if !rotateBackoff(i, r.Context()) {
 					break
 				}
@@ -528,11 +544,13 @@ func (h *Handler) runMediaWithTimeout(w http.ResponseWriter, r *http.Request, re
 		if err == nil {
 			h.cfg.Pool.Release(acct.UID)
 			h.cfg.Pool.NoteSuccess(acct.UID)
+			log.Printf("[media-lease] uid=%s ok=true elapsed=%s", acct.UID, time.Since(started).Round(time.Millisecond))
 			return res, nil
 		}
 		lastErr = err
 		h.cfg.Pool.NoteFailures(acct.UID)
 		h.cfg.Pool.Release(acct.UID)
+		log.Printf("[media-lease] uid=%s ok=false elapsed=%s err=%v", acct.UID, time.Since(started).Round(time.Millisecond), err)
 
 		var uerr *upstream.Error
 		if errors.As(err, &uerr) {
@@ -555,10 +573,10 @@ var errNoMediaAccount = errors.New("no healthy account available")
 
 // mediaHardStopCodes 换号无意义的错误种类：请求本身的问题，重试只会浪费健康号。
 var mediaHardStopCodes = map[upstream.ErrKind]struct{}{
-	upstream.ErrBadParams:     {},
-	upstream.ErrPromptTooLong: {},
+	upstream.ErrBadParams:      {},
+	upstream.ErrPromptTooLong:  {},
 	upstream.ErrContentBlocked: {},
-	upstream.ErrHardCredit:    {},
+	upstream.ErrHardCredit:     {},
 }
 
 // writeMediaError 把上游/本地错误映射成 OpenAI 风格错误响应。

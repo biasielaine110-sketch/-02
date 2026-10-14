@@ -133,6 +133,7 @@ type Config struct {
 	Pool struct {
 		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
 		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
+		MaxInFlightMedia   int    `json:"max_in_flight_media"`  // 媒体（生图/生视频）专用单账号在途上限；0 = 回落 max_in_flight，设 1 = 一任务一账号
 		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
 		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
 		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
@@ -206,6 +207,10 @@ func Default() *Config {
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
 	// 的 0 没有合理语义，回退分档默认最稳）。
 	c.Pool.MaxInFlightGlobal = 2
+	// MaxInFlightMedia 缺省 0 = 未设置 → 媒体回落 max_in_flight / max_in_flight_global
+	// （零回归：不写此项的老配置行为完全不变）。显式设 1 才启用「一任务一账号」：
+	// 每条生图/生视频独占一个账号，N 条并行任务自动分散到 N 个账号。
+	c.Pool.MaxInFlightMedia = 0
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
@@ -433,6 +438,12 @@ func (c *Config) normalize() error {
 	// global 在途分档：0/负数视为未设置回落默认 2（WAF 403 修复 P1-1）。
 	if c.Pool.MaxInFlightGlobal <= 0 {
 		c.Pool.MaxInFlightGlobal = 2
+	}
+	// 媒体在途分档：负数视为未设置（回落 max_in_flight，与 max_in_flight 的
+	// 0=不限语义不同——分档键的 0/负值没有合理语义）。**不 clamp 成默认值**：
+	// 0 就是「不设分档」，媒体档在此保持缺省即零回归。
+	if c.Pool.MaxInFlightMedia < 0 {
+		c.Pool.MaxInFlightMedia = 0
 	}
 	if c.Pool.IdleWeightPerHour <= 0 {
 		c.Pool.IdleWeightPerHour = 0.5

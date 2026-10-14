@@ -37,6 +37,17 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// maxInFlightMedia 媒体（生图/生视频）专用单账号在途上限：0 = 未设置，回落
+	// inFlightLimit（零回归）。显式设 1 = 「一任务一账号」：媒体任务只在账号无在途
+	// 请求时才能占用，于是 N 条并行媒体任务自动落到 N 个不同账号。
+	//
+	// 语义要点：媒体与 chat 共用 entry.inFlight 这同一枚计数，所以媒体档低于 chat 档时，
+	// 媒体需要账号「当前完全空闲」才启动。
+	//   - 好处：单账号总上游并发不超过已验证的 max_in_flight，对上游 WAF 友好（媒体是
+	//     长任务，若与 chat 各占一份，单号瞬时并发会翻倍，而 3 这个值是照 chat 实测定的）；
+	//   - 代价：chat 繁忙时媒体暂时占不到该号（选号会自动轮换到池内其他账号，14 个号的
+	//     池子里基本无感）。
+	maxInFlightMedia int
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -160,6 +171,17 @@ func (p *Pool) SetMaxInFlightGlobal(n int) {
 	}
 }
 
+// SetMaxInFlightMedia 注入媒体（生图/生视频）专用单账号在途上限；
+// 0 = 未设置，回落 maxInFlightGlobal/maxInFlight（零回归，风格同 SetMaxInFlightGlobal）。
+// 设 1 即「一任务一账号」。负值保留原值。
+func (p *Pool) SetMaxInFlightMedia(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.maxInFlightMedia = n
+	}
+}
+
 // inFlightLimit 报告账号的生效在途上限（global 分档优先，回落 maxInFlight）；
 // 0 = 不限。调用方需已持 p.mu（或快照过 limit，见 Acquire）。
 func (p *Pool) inFlightLimit(e *entry) int {
@@ -167,6 +189,27 @@ func (p *Pool) inFlightLimit(e *entry) int {
 		return p.maxInFlightGlobal
 	}
 	return p.maxInFlight
+}
+
+// inFlightLimitFor 报告账号在**指定用途**下的生效在途上限：
+// media=true 且 maxInFlightMedia>0 时走媒体专用档，否则回落 inFlightLimit（realm 分档）。
+// 只给媒体路径用（生图/生视频），chat 路径仍走 inFlightLimit，互不影响。
+// 调用方需已持 p.mu（同 inFlightLimit）。
+func (p *Pool) inFlightLimitFor(e *entry, media bool) int {
+	if media && p.maxInFlightMedia > 0 {
+		return p.maxInFlightMedia
+	}
+	return p.inFlightLimit(e)
+}
+
+// inFlightFullFor 报告账号在指定用途下是否已占满在途名额。
+// limit=0 不限 → 恒 false。调用方需已持 p.mu（本方法只读上限）。
+func (p *Pool) inFlightFullFor(e *entry, media bool) bool {
+	limit := p.inFlightLimitFor(e, media)
+	if limit <= 0 {
+		return false
+	}
+	return e.inFlight.Load() >= int64(limit)
 }
 
 // SetStore 注入池状态快照镜像（redisstore.Store）。nil 表示不镜像（纯本地恢复）。
@@ -180,17 +223,27 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 // RestoreFromSnapshot 择新恢复：比较本地 state.json 与 Redis 快照，采用较新者。
 // 无快照、快照无 savedAt、或本地不存在/不可读时，都会被判定为"本地优先/跳过快照"，
 // 同时打一条恢复来源日志。必须在 SyncToDir 之前调用（SyncToDir 只增删不入值）。
-// Acquire 为 uid 占一个在途名额（会话粘性命中后调用）；池上限内返回 true。
+// Acquire 为 uid 占一个在途名额（chat 口径）；池上限内返回 true。
 // 名额用 entry.inFlight 原子自增，满额返回 false。上限按账号 realm 分档
 // （global 档 maxInFlightGlobal，P1-1；未设置回落 maxInFlight）。
-func (p *Pool) Acquire(uid string) bool {
+func (p *Pool) Acquire(uid string) bool { return p.acquire(uid, false) }
+
+// AcquireMedia 同 Acquire，但按**媒体专用档**判定上限（maxInFlightMedia>0 时生效，
+// 否则回落 inFlightLimit）。生图/生视频必须用这个：设 maxInFlightMedia=1 即实现
+// 「一条任务一个账号」——同号在途达到 1 后不再被媒体选号挑中，任务自动分散到其他账号。
+// 释放用同一个 Release（媒体与 chat 共用 entry.inFlight 计数）。
+func (p *Pool) AcquireMedia(uid string) bool { return p.acquire(uid, true) }
+
+// acquire 是 Acquire/AcquireMedia 的共同实现：media 决定用哪一档上限。
+// 上限先持读锁快照（inFlightLimitFor 只读字段），随后无锁 CAS 抢名额。
+func (p *Pool) acquire(uid string, media bool) bool {
 	p.mu.RLock()
 	e, ok := p.byUID[uid]
 	if !ok {
 		p.mu.RUnlock()
 		return false
 	}
-	limit := p.inFlightLimit(e)
+	limit := p.inFlightLimitFor(e, media)
 	p.mu.RUnlock()
 	if limit <= 0 {
 		// 不限：计数仍累加（供状态观测），但永不拒绝。
