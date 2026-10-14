@@ -25,6 +25,10 @@ type mediaRecorder struct {
 	mioraAuth     string
 	mioraSubmit   string
 	mioraQueryRaw string
+
+	// miora 图片通道（sync）
+	mioraImageSubmit     string
+	mioraImageEditSubmit string
 }
 
 // mediaFakeUpstream 按路径 + X-TC-Action 路由的假上游：
@@ -73,6 +77,17 @@ func mediaFakeUpstream(t *testing.T, rec *mediaRecorder) *upstream.Client {
 				rec.mioraQueryRaw = string(raw)
 				status = 200
 				body = `{"code":0,"failed":false,"data":{"miora-task-1":{"status":"completed","resultFiles":[{"signedUrl":"https://cos.example/miora.mp4","mimeType":"video/mp4"}]}},"message":"successful","httpStatus":200}`
+			case strings.HasSuffix(r.URL.Path, "/api/ai/workbuddy-proxy/image/generate/submit"):
+				rec.mioraAuth = r.Header.Get("Authorization")
+				rec.mioraImageSubmit = string(raw)
+				status = 200
+				// 图片是 mode=sync：产物直接在 submit 响应里（无轮询）。
+				body = `{"code":0,"failed":false,"message":"successful","httpStatus":200,"data":{"upstreamTaskId":"wb-sync-1","mode":"sync","status":"completed","model":"hy-image-3.5-wb","provider":"copilot-image","errorMessage":null,"resultFiles":[{"signedUrl":"https://cos.example/miora.png","mimeType":"image/png","expiresAt":1791952510}]}}`
+			case strings.HasSuffix(r.URL.Path, "/api/ai/workbuddy-proxy/image/edit/submit"):
+				rec.mioraAuth = r.Header.Get("Authorization")
+				rec.mioraImageEditSubmit = string(raw)
+				status = 200
+				body = `{"code":0,"failed":false,"message":"successful","httpStatus":200,"data":{"upstreamTaskId":"wb-sync-2","mode":"sync","status":"completed","model":"hy-image-3.5-edit-wb","provider":"copilot-image","errorMessage":null,"resultFiles":[{"signedUrl":"https://cos.example/miora-edit.png","mimeType":"image/png","expiresAt":1791952520}]}}`
 			default:
 				status, body = 404, `no route`
 			}
@@ -313,13 +328,15 @@ func TestVideosGenerationsMioraValidation(t *testing.T) {
 // TestMediaModelEntriesInCatalog 媒体模型登记进 /v1/models 目录（带 type 标记）。
 func TestMediaModelEntriesInCatalog(t *testing.T) {
 	entries := mediaModelEntries()
-	if len(entries) != 3 {
-		t.Fatalf("want 3 media entries, got %d", len(entries))
+	if len(entries) != 5 {
+		t.Fatalf("want 5 media entries, got %d", len(entries))
 	}
 	want := map[string]string{
 		"cn:" + upstream.DefaultImageModel:       "image",
 		"cn:kling-" + upstream.DefaultVideoModel: "video",
 		"cn:miora-" + upstream.MioraVideoModel:   "video",
+		"cn:" + upstream.MioraImageModel:         "image",
+		"cn:" + upstream.MioraImageEditModel:     "image",
 	}
 	for _, e := range entries {
 		id, _ := e["id"].(string)

@@ -1,7 +1,9 @@
 // media.go 上游多模态（生图 / 生视频）通道。
 //
-// 两条链路的鉴权形态完全不同，不要混用：
-//   - 生图 /v2/images/generations：与 chat 同族的 Bearer accessToken，同步返回图片 URL。
+// 三条链路的鉴权形态完全不同，不要混用：
+//   - 生图 /v2/images/generations：与 chat 同族的 Bearer accessToken，同步返回图片 URL（仅文生图）。
+//   - miora 生图/改图（media_miora_image.go）：自签 ck_t_ 临时密钥 + workbuddy-proxy，
+//     文生图与改图两条端点，`mode=sync` 时产物直接在 submit 响应里返回。
 //   - 生视频 /agenttool/v1/tcproxy：TC3-HMAC-SHA256 签名代理（腾讯云转发），
 //     secret_id = "<provider>.<accessToken>"，secret_key 内置固定串；
 //     提交返回 JobId，需再轮询 DescribeAigcVideoJob 取产物。
@@ -92,6 +94,18 @@ func MediaModelCatalog() []MediaModel {
 			Type:        "video",
 			Capability:  "video_generation",
 			Description: "MiniMax H3 视频（miora 代理，支持文生/首尾帧/参考生；异步 POST /v1/videos/generations + GET /v1/videos/generations/{id}）",
+		},
+		{
+			ID:          MioraImageModel,
+			Type:        "image",
+			Capability:  "image_generation",
+			Description: "Miora 生图（同步 POST /v1/images/generations；也可以直接看 OpenAI 风格的 POST /v1/images/edits）",
+		},
+		{
+			ID:          MioraImageEditModel,
+			Type:        "image",
+			Capability:  "image_edit",
+			Description: "Miora 改图/重绘（给图 + 指令改图；OpenAI 风格 POST /v1/images/edits，multipart 或 JSON）",
 		},
 	}
 }

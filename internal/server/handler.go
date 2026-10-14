@@ -156,6 +156,9 @@ func NewHandler(cfg Config) *Handler {
 	// 协议调用的前端（如「Nww-无限画布」）直接使用。
 	h.mux.HandleFunc("POST /v1/videos", h.withAuth(h.videosCompatCreate))
 	h.mux.HandleFunc("GET /v1/videos/{id}", h.withAuth(h.videosCompatGet))
+	// OpenAI Images Edits 兼容层（见 image_compat.go）：给图 + 指令改图，固定走 miora
+	// 通道（旧生图通道只有文生图）。供按 OpenAI 图片协议调用的前端（如「Nww-无限画布」）使用。
+	h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(h.imagesEditsCompat))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {

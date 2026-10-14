@@ -33,6 +33,15 @@ const videoMaxBodyBytes = 24 << 20
 // 生图实测数秒；视频提交/查询都是短请求（产物由上游异步产出），30s 足够。
 const mediaTimeout = 30 * time.Second
 
+// mioraImageTimeout miora 生图/改图的上游调用时长上限。
+// miora 图片走 `mode=sync`：**出图耗时全部发生在这一次提交里**，不能沿用 30s 的
+// 短媒体超时（官方 MCP 对此给的 submit 超时是 390s、轮询上限 90s）。
+const mioraImageTimeout = 180 * time.Second
+
+// imageUploadMaxBodyBytes 改图请求体上限。改图要内联参考图（base64 或 data URI），
+// 单张 2K 图编码后数 MB，24MB 可容纳数张；纯文生图仍走更严的 1MB（mediaMaxBodyBytes）。
+const imageUploadMaxBodyBytes = 24 << 20
+
 // imageDownloadTimeout b64_json 模式下回源下载图片的时长上限。
 const imageDownloadTimeout = 60 * time.Second
 
@@ -41,12 +50,25 @@ const imageDownloadTimeout = 60 * time.Second
 // ---------------------------------------------------------------------------
 
 // imageRequest OpenAI 兼容生图入参。
+//
+// miora 扩展（仅 cn:miora-image* 生效）：
+//   - Quality：上游质量档（如 standard / hd），可选；
+//   - Images ：非 nil 即改图（给图 + 指令），数组须非空。取值与视频的
+//     MediaPayload 同形：字符串（http(s) URL / data URI / 裸 base64）或
+//     对象 {"base64":…|"url":…|"file_key":…}。用指针区分「未提供」与「空数组」。
 type imageRequest struct {
-	Model          string `json:"model"`
-	Prompt         string `json:"prompt"`
-	N              int    `json:"n"`
-	Size           string `json:"size"`
-	ResponseFormat string `json:"response_format"` // "url"（默认）/ "b64_json"
+	Model          string                    `json:"model"`
+	Prompt         string                    `json:"prompt"`
+	N              int                       `json:"n"`
+	Size           string                    `json:"size"`
+	Quality        string                    `json:"quality"`
+	ResponseFormat string                    `json:"response_format"` // "url"（默认）/ "b64_json"
+	Images         *[]upstream.MediaPayload  `json:"images"`
+}
+
+// hasExtraImageFields 报告请求是否携带仅 miora 图片通道认识的字段。
+func (req imageRequest) hasExtraImageFields() bool {
+	return req.Images != nil || strings.TrimSpace(req.Quality) != ""
 }
 
 func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
@@ -65,8 +87,20 @@ func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	realm, bare := resolveModel(req.Model)
 	// 未指定模型时按 realm 回落默认生图模型。
-	if bare == "" {
+	if strings.TrimSpace(bare) == "" {
 		bare = upstream.DefaultImageModel
+	}
+
+	// miora 图片通道（文生图 / 改图）：与旧通道（混元 /v2/images/generations）机制不同，分开走。
+	if upstream.IsMioraImageModel(bare) {
+		h.imagesGenerationsMiora(w, r, realm, req)
+		return
+	}
+	// images/quality 是 miora 专属字段；旧通道会静默忽略，调用方会误以为改图生效，故本地拒绝。
+	if req.hasExtraImageFields() {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"images/quality are only supported by cn:miora-image* models")
+		return
 	}
 
 	imgs, uerr := h.runMedia(w, r, realm, func(ctx context.Context, a *auth.Auth) (any, error) {
@@ -81,10 +115,48 @@ func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload := imgs.(mediaImagePayload)
+	h.writeImagesResponse(w, r, payload.Images, req.ResponseFormat, payload.Usage)
+}
 
-	format := strings.TrimSpace(req.ResponseFormat)
-	data := make([]map[string]any, 0, len(payload.Images))
-	for _, im := range payload.Images {
+// imagesGenerationsMiora 处理 miora 图片通道的 POST /v1/images/generations。
+// 带 images 即改图（/image/edit/submit），不带即文生图（/image/generate/submit）。
+func (h *Handler) imagesGenerationsMiora(w http.ResponseWriter, r *http.Request, realm string, req imageRequest) {
+	if req.N > 1 {
+		// 上游一次只出一张，静默只给 1 张会让调用方以为请求被满足，故明确拒绝。
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"n greater than 1 is not supported by cn:miora-image* models")
+		return
+	}
+	var images *[]upstream.MediaPayload
+	if req.Images != nil {
+		list := *req.Images
+		images = &list
+	}
+	res, uerr := h.runMediaWithTimeout(w, r, realm, mioraImageTimeout,
+		func(ctx context.Context, a *auth.Auth) (any, error) {
+			return h.cfg.Upstream.SubmitImageMiora(ctx, a, upstream.MioraImageRequest{
+				Prompt:  req.Prompt,
+				Size:    req.Size,
+				Quality: req.Quality,
+				Images:  images,
+			})
+		})
+	if uerr != nil {
+		h.writeMediaError(w, uerr)
+		return
+	}
+	ir := res.(*upstream.MioraImageResult)
+	h.writeImagesResponse(w, r, []upstream.ImageResult{{URL: ir.URL}}, req.ResponseFormat, upstream.MediaUsage{})
+}
+
+// writeImagesResponse 按 OpenAI 生图响应形态回包。
+// response_format=b64_json 时回源下载并内联 base64（上游 signedUrl 约 1 小时失效，
+// 需要长期可用的调用方应选该形态）；默认直出上游临时直链。
+func (h *Handler) writeImagesResponse(w http.ResponseWriter, r *http.Request,
+	images []upstream.ImageResult, format string, usage upstream.MediaUsage) {
+
+	data := make([]map[string]any, 0, len(images))
+	for _, im := range images {
 		item := map[string]any{}
 		if format == "b64_json" {
 			b64, err := fetchAsBase64(r.Context(), im.URL)
@@ -107,8 +179,8 @@ func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		"created": time.Now().Unix(),
 		"data":    data,
 	}
-	if payload.Usage.TotalTokens > 0 || payload.Usage.Credit > 0 {
-		resp["usage"] = payload.Usage
+	if usage.TotalTokens > 0 || usage.Credit > 0 {
+		resp["usage"] = usage
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -416,6 +488,13 @@ func (h *Handler) readMediaBody(w http.ResponseWriter, r *http.Request, kind str
 //     一次生图失败不代表账号 chat 不可用，不应影响 chat 侧的选号排序。
 func (h *Handler) runMedia(w http.ResponseWriter, r *http.Request, realm string,
 	call func(ctx context.Context, a *auth.Auth) (any, error)) (any, error) {
+	return h.runMediaWithTimeout(w, r, realm, mediaTimeout, call)
+}
+
+// runMediaWithTimeout 同 runMedia，但可指定单次上游调用的超时。
+// miora 图片是「一次提交内完成出图」，需要比短视频调用宽松得多（见 mioraImageTimeout）。
+func (h *Handler) runMediaWithTimeout(w http.ResponseWriter, r *http.Request, realm string,
+	timeout time.Duration, call func(ctx context.Context, a *auth.Auth) (any, error)) (any, error) {
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -443,7 +522,7 @@ func (h *Handler) runMedia(w http.ResponseWriter, r *http.Request, realm string,
 			_ = acct.SaveAtomic()
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), mediaTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		res, err := call(ctx, acct)
 		cancel()
 
