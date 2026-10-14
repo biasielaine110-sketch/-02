@@ -25,6 +25,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -55,6 +56,8 @@ func (h *Handler) imagesEditsCompat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	// 前端发的是比例（1:1 / 16:9 …）或 auto，上游只认「数字x数字」——先归一。
+	req.Size = normalizeImageSize(req.Size)
 	if strings.TrimSpace(req.Prompt) == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "prompt is required")
 		return
@@ -227,4 +230,50 @@ func mergeMediaRefs(raws ...json.RawMessage) ([]upstream.MediaPayload, error) {
 func isMioraImageSpec(spec string) bool {
 	s := strings.TrimSpace(spec)
 	return upstream.IsMioraImageModel(s) || strings.EqualFold(s, upstream.MioraVideoVendor)
+}
+
+// ---------------------------------------------------------------------------
+// size 归一（比例 → 像素）
+// ---------------------------------------------------------------------------
+
+// pxSizePattern 上游接受的尺寸写法：`数字x数字`（宽松认 × / * / X 与空格）。
+var pxSizePattern = regexp.MustCompile(`^\d{1,5}\s*[xX×*]\s*\d{1,5}$`)
+
+// pxSizeSeparator 像素尺寸里的分隔符（连同两侧空白），统一改写成小写 x。
+var pxSizeSeparator = regexp.MustCompile(`\s*[xX×*]\s*`)
+
+// imageSizeAliases 把前端常见的**比例**写法映射到上游要求的像素尺寸。
+//
+// 起因（实测）：上游只认 `数字x数字`，收到 `1:1` / `16:9` / `auto` 一律回
+// 400 `size must be in format "数字x数字"`。而按 OpenAI 协议调用的前端
+// （如「Nww-无限画布」的图像尺寸选择器）发的**正是比例**，照原样转发必然失败。
+// 这里做一次忠实的翻译（比例 → 最接近的像素尺寸），不是降级：画幅语义保持不变。
+var imageSizeAliases = map[string]string{
+	"1:1":  "1024x1024",
+	"4:3":  "1024x768",
+	"3:4":  "768x1024",
+	"3:2":  "1152x768",
+	"2:3":  "768x1152",
+	"16:9": "1280x720",
+	"9:16": "720x1280",
+	"21:9": "1344x576",
+}
+
+// normalizeImageSize 放宽生图 / 改图的 size 入参：
+//   - 空 / `auto`                → ""（丢弃，让上游用默认尺寸；OpenAI 的 auto 就是这个语义）
+//   - `数字x数字`（含 × / * / 空格）→ 归一为小写 x 后透出
+//   - 常见比例（1:1 / 16:9 …）     → 映射到最接近的像素尺寸
+//   - 其它                       → 原样透出，交由上游给出清晰报错（不静默改写，避免画幅被悄悄换掉）
+func normalizeImageSize(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.EqualFold(s, "auto") {
+		return ""
+	}
+	if pxSizePattern.MatchString(s) {
+		return pxSizeSeparator.ReplaceAllString(s, "x")
+	}
+	if v, ok := imageSizeAliases[strings.ToLower(s)]; ok {
+		return v
+	}
+	return s
 }

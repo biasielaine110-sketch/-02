@@ -93,9 +93,9 @@ func TestImagesGenerationsMioraEdit(t *testing.T) {
 // TestImagesGenerationsMioraValidation 本地闸门：n>1、非 miora 模型带 images 均在本地 400。
 func TestImagesGenerationsMioraValidation(t *testing.T) {
 	cases := []string{
-		`{"model":"cn:miora-image","prompt":"x","n":2}`,                          // 上游一次只出一张
+		`{"model":"cn:miora-image","prompt":"x","n":2}`,                             // 上游一次只出一张
 		`{"model":"hunyuan-image-alpha","prompt":"x","images":["https://x/a.png"]}`, // 旧通道不认 images
-		`{"model":"hunyuan-image-alpha","prompt":"x","quality":"hd"}`,             // 旧通道不认 quality
+		`{"model":"hunyuan-image-alpha","prompt":"x","quality":"hd"}`,               // 旧通道不认 quality
 	}
 	for _, body := range cases {
 		rec := &mediaRecorder{}
@@ -238,5 +238,44 @@ func TestIsMioraImageSpec(t *testing.T) {
 	}
 	if !upstream.IsMioraImageModel(upstream.MioraImageEditModel) {
 		t.Errorf("catalog ID %q must match the image prefix", upstream.MioraImageEditModel)
+	}
+}
+
+// TestNormalizeImageSize size 归一：上游只认「数字x数字」，前端爱发比例或 auto。
+//
+// 实测背景：直接把 `1:1` / `16:9` / `auto` 转给上游会回
+// 400 `size must be in format "数字x数字"`（「Nww-无限画布」的图像尺寸选择器就是发比例的）。
+func TestNormalizeImageSize(t *testing.T) {
+	cases := map[string]string{
+		// auto / 空 → 丢弃，让上游用默认
+		"":     "",
+		"  ":   "",
+		"auto": "",
+		"AUTO": "",
+		// 比例 → 像素（忠实翻译，画幅语义不变）
+		"1:1":  "1024x1024",
+		"4:3":  "1024x768",
+		"3:4":  "768x1024",
+		"3:2":  "1152x768",
+		"2:3":  "768x1152",
+		"16:9": "1280x720",
+		"9:16": "720x1280",
+		"21:9": "1344x576",
+		// 已是像素 → 归一分隔符/空白后透出
+		"1024x1024":    "1024x1024",
+		"1024X1024":    "1024x1024",
+		"1024*1024":    "1024x1024",
+		"1024×1024":    "1024x1024",
+		"1024 x 1024":  "1024x1024",
+		"  512 × 512 ": "512x512",
+		// 无法识别 → 原样透出，交上游清晰报错（不静默改写画幅）
+		"2K":    "2K",
+		"huge":  "huge",
+		"1024x": "1024x",
+	}
+	for in, want := range cases {
+		if got := normalizeImageSize(in); got != want {
+			t.Errorf("normalizeImageSize(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

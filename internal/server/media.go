@@ -85,6 +85,8 @@ func (h *Handler) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "prompt is required")
 		return
 	}
+	// 前端发的是比例（1:1 / 16:9 …）或 auto，上游只认「数字x数字」——先归一。
+	req.Size = normalizeImageSize(req.Size)
 	realm, bare := resolveModel(req.Model)
 	// 未指定模型时按 realm 回落默认生图模型。
 	if strings.TrimSpace(bare) == "" {
