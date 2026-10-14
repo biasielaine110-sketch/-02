@@ -150,6 +150,12 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(h.imagesGenerations))
 	h.mux.HandleFunc("POST /v1/videos/generations", h.withAuth(h.videosGenerations))
 	h.mux.HandleFunc("GET /v1/videos/generations/{id}", h.withAuth(h.videosGenerationGet))
+	// OpenAI Videos API 兼容层（见 video_compat.go）：与原生端点同一条提交/查询管线，
+	// 但入参为 OpenAI 风格（JSON 或 multipart，含 input_reference 参考图），状态词表为
+	// queued/in_progress/completed/failed，产物直链放在 video_url/url——供按 OpenAI 视频
+	// 协议调用的前端（如「Nww-无限画布」）直接使用。
+	h.mux.HandleFunc("POST /v1/videos", h.withAuth(h.videosCompatCreate))
+	h.mux.HandleFunc("GET /v1/videos/{id}", h.withAuth(h.videosCompatGet))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {

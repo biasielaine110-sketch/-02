@@ -159,9 +159,29 @@ func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "parse request: "+err.Error())
 		return
 	}
+	jobID, ok := h.submitVideoJob(w, r, req)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":         jobID,
+		"object":     "video",
+		"created":    time.Now().Unix(),
+		"status":     "submitted",
+		"status_url": "/v1/videos/generations/" + jobID,
+	})
+}
+
+// submitVideoJob 校验并提交一次视频任务，成功后把任务登记进任务表并返回 jobID。
+// 校验/上游/调度失败时已写好响应，返回 ("", false)。
+//
+// 抽出来供两处共用：网关原生 POST /v1/videos/generations 与 OpenAI 风格的
+// POST /v1/videos（见 video_compat.go）。两者入参形态不同，但提交语义必须完全一致——
+// 尤其 miora 图生视频的本地闸门（空 input 会静默降级成文生）绝不能因入口不同而放行。
+func (h *Handler) submitVideoJob(w http.ResponseWriter, r *http.Request, req videoRequest) (string, bool) {
 	if strings.TrimSpace(req.Prompt) == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "prompt is required")
-		return
+		return "", false
 	}
 	realm, bare := resolveModel(req.Model)
 	// 把目录 ID（如 "kling-v2.6" / "miora-minimax-h3"）解析成 vendor + model；显式 vendor 字段优先。
@@ -176,7 +196,7 @@ func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
 	if req.hasMioraVisualInput() && channel != videoChannelMiora {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 			"first_frame/last_frame/references are only supported by cn:miora-* models")
-		return
+		return "", false
 	}
 
 	type submitResult struct {
@@ -208,18 +228,11 @@ func (h *Handler) videosGenerations(w http.ResponseWriter, r *http.Request) {
 	})
 	if uerr != nil {
 		h.writeMediaError(w, uerr)
-		return
+		return "", false
 	}
 	sr := res.(submitResult)
 	videoJobs.put(sr.JobID, sr.UID, sr.Channel)
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":         sr.JobID,
-		"object":     "video",
-		"created":    time.Now().Unix(),
-		"status":     "submitted",
-		"status_url": "/v1/videos/generations/" + sr.JobID,
-	})
+	return sr.JobID, true
 }
 
 func (h *Handler) videosGenerationGet(w http.ResponseWriter, r *http.Request) {
@@ -228,35 +241,10 @@ func (h *Handler) videosGenerationGet(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "job id is required")
 		return
 	}
-	uid, channel, ok := videoJobs.get(jobID)
+	job, ok := h.queryVideoJob(w, r, jobID)
 	if !ok {
-		// 进程重启后任务表清空（进程内状态，不落盘）。
-		// 明确回报「未知任务」而不是编造状态：调用方需重新提交。
-		writeOpenAIError(w, http.StatusNotFound, "job_not_found",
-			"unknown video job (the gateway may have restarted); please submit a new job")
 		return
 	}
-	acct := h.cfg.Pool.PickByUID(uid)
-	if acct == nil {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
-			"the account that owns this job is temporarily unavailable")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), mediaTimeout)
-	defer cancel()
-	var job *upstream.VideoJob
-	var err error
-	if channel == videoChannelMiora {
-		job, err = h.cfg.Upstream.QueryVideoMiora(ctx, acct, jobID)
-	} else {
-		job, err = h.cfg.Upstream.QueryVideo(ctx, acct, jobID)
-	}
-	if err != nil {
-		h.writeMediaError(w, err)
-		return
-	}
-
 	out := map[string]any{
 		"id":              job.JobID,
 		"object":          "video",
@@ -273,6 +261,43 @@ func (h *Handler) videosGenerationGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// queryVideoJob 查一次视频任务状态。失败时已写好响应，返回 (nil, false)。
+// 供原生 GET /v1/videos/generations/{id} 与 OpenAI 风格 GET /v1/videos/{id} 共用。
+//
+// 必须记着提交账号：上游查询要用**提交该任务的账号**鉴权（换号取不到结果）；
+// 任务表缺失（如进程重启）则明确回 404，不编造状态。
+func (h *Handler) queryVideoJob(w http.ResponseWriter, r *http.Request, jobID string) (*upstream.VideoJob, bool) {
+	uid, channel, ok := videoJobs.get(jobID)
+	if !ok {
+		// 进程重启后任务表清空（进程内状态，不落盘）。
+		// 明确回报「未知任务」而不是编造状态：调用方需重新提交。
+		writeOpenAIError(w, http.StatusNotFound, "job_not_found",
+			"unknown video job (the gateway may have restarted); please submit a new job")
+		return nil, false
+	}
+	acct := h.cfg.Pool.PickByUID(uid)
+	if acct == nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
+			"the account that owns this job is temporarily unavailable")
+		return nil, false
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), mediaTimeout)
+	defer cancel()
+	var job *upstream.VideoJob
+	var err error
+	if channel == videoChannelMiora {
+		job, err = h.cfg.Upstream.QueryVideoMiora(ctx, acct, jobID)
+	} else {
+		job, err = h.cfg.Upstream.QueryVideo(ctx, acct, jobID)
+	}
+	if err != nil {
+		h.writeMediaError(w, err)
+		return nil, false
+	}
+	return job, true
 }
 
 // mediaVideoStatus 把上游状态归一到 OpenAI 风格三态，未知原样透出。
