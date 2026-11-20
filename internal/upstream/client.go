@@ -39,6 +39,7 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
+	ErrProviderUnavailable           // 11134「model provider is temporarily unavailable」→ provider 侧临时故障，与账号无关：不罚号、媒体层不轮转
 )
 
 func (k ErrKind) String() string {
@@ -67,6 +68,8 @@ func (k ErrKind) String() string {
 		return "account_fault"
 	case ErrClient:
 		return "client"
+	case ErrProviderUnavailable:
+		return "provider_unavailable"
 	default:
 		return "none"
 	}
@@ -134,6 +137,19 @@ var accountFaultMarkers = []string{
 	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
+}
+
+// providerUnavailableMarkers 上游 code 11134「model provider is temporarily
+// unavailable, please retry later or switch to another model」（extError.code=
+// service_unavailable）。2026-11-20 miora-image-edit 实测形态：HTTP 400 + 该信封。
+// 定位：provider 侧临时故障（模型后端过载/下线），**与账号无关**——换任何账号都会
+// 打到同一个 provider，轮转只会把 MaxRotate × mioraImageTimeout（媒体层最多
+// 3×180s≈9 分钟）的白等强加给调用方。与 ErrPromptTooLong 同哲学：与账号无关的
+// 确定性故障不罚号、不轮转，快速透传原文让调用方自己决定何时重试。
+// marker 双通道：msg 精确指纹（首选）+ extError 业务码（兜底，上游有时只给码）。
+var providerUnavailableMarkers = []string{
+	"model provider is temporarily unavailable",
+	"service_unavailable",
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
@@ -487,6 +503,14 @@ func Classify(status int, body string) ErrKind {
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
 	if status >= 400 {
+		// 11134「provider 临时不可用」先于内容策略/参数错误/通用 4xx：与账号无关的
+		// provider 侧故障（同 ErrPromptTooLong 的「请求/模型侧问题」哲学），换号无意义，
+		// 必须在兜底前分流——落 ErrClient 的代价是媒体层白转 MaxRotate 圈。
+		for _, m := range providerUnavailableMarkers {
+			if strings.Contains(lower, m) || strings.Contains(body, m) {
+				return ErrProviderUnavailable
+			}
+		}
 		for _, m := range contentBlockedMarkers {
 			if strings.Contains(lower, m) {
 				return ErrContentBlocked

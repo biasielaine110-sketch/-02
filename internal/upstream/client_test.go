@@ -41,6 +41,15 @@ func TestClassify(t *testing.T) {
 		{400, `Illegal API invocation from an unapproved channel`, ErrContentBlocked},
 		{400, `{"code":11128,"msg":"blocked by security policy"}`, ErrContentBlocked},
 		{400, `unapproved channel`, ErrContentBlocked},
+		// 11134「provider temporarily unavailable」（2026-11-20 miora-image-edit 实测形态）：
+		// provider 侧临时故障与账号无关 → ErrProviderUnavailable：不罚号、媒体层不轮转
+		//（mediaHardStopCodes），否则最坏 MaxRotate × mioraImageTimeout≈9 分钟悬挂。
+		{400, `{"code":11134,"msg":"Create image failed with error: the model provider is temporarily unavailable, please retry later or switch to another model","requestId":"R4Xids5fen4eEcvt","extError":{"code":"service_unavailable"}}`, ErrProviderUnavailable},
+		// 上游只给 extError 业务码没给文案时也认（service_unavailable 兜底通道）。
+		{400, `{"code":7,"msg":"create failed","extError":{"code":"service_unavailable"}}`, ErrProviderUnavailable},
+		// 「rate-limiting requests」（11140 软限流文案）不得误判成 provider 不可用：
+		// 同是 "model provider is ..." 开头，语义完全不同（限流要短冷却换号，不可用要快速透传）。
+		{200, `{"code":11140,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`, ErrSoftRate},
 		// 通用 4xx（非审核文案）：仍判 ErrClient，只换号不罚。
 		{400, `bad request`, ErrClient},
 		// ErrBadParams：请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）。

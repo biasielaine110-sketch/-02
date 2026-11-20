@@ -578,11 +578,15 @@ func (h *Handler) runMediaWithTimeout(w http.ResponseWriter, r *http.Request, re
 var errNoMediaAccount = errors.New("no healthy account available")
 
 // mediaHardStopCodes 换号无意义的错误种类：请求本身的问题，重试只会浪费健康号。
+// ErrProviderUnavailable（11134）也在列：provider 侧临时故障与账号无关，换号仍打到
+// 同一个 provider；不 hard-stop 的最坏代价是 MaxRotate × mioraImageTimeout
+// （3×180s≈9 分钟）的悬挂，调用方只看到「后端生成很久、一直拿不到图」。
 var mediaHardStopCodes = map[upstream.ErrKind]struct{}{
-	upstream.ErrBadParams:      {},
-	upstream.ErrPromptTooLong:  {},
-	upstream.ErrContentBlocked: {},
-	upstream.ErrHardCredit:     {},
+	upstream.ErrBadParams:           {},
+	upstream.ErrPromptTooLong:       {},
+	upstream.ErrContentBlocked:      {},
+	upstream.ErrHardCredit:          {},
+	upstream.ErrProviderUnavailable: {},
 }
 
 // writeMediaError 把上游/本地错误映射成 OpenAI 风格错误响应。
